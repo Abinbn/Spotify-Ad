@@ -6,6 +6,8 @@ rename, star and export.
 
 - No account, no cloud, no analytics. Recordings stay in app-private storage.
 - Real WAV audio (not re-encoded, not synthesised).
+- Lossless trim: cut the start or end of a clip by rewriting the WAV header — no re-encoding, and
+  the original is only replaced once the trimmed copy is safely written.
 - Material 3 UI with system light/dark themes and the platform font.
 - Works on Android 7.0+ (internal audio capture needs Android 10+).
 
@@ -36,6 +38,9 @@ rename, star and export.
    clip appears in the library when the music resumes.
 
 `Record now` captures the next two minutes manually — useful when Spotify does not label an ad.
+
+Open any recording to rename it, add notes, **trim** it (drag a start/end selection; the WAV is cut
+losslessly), share it, export it to `Music/SpotAd`, or delete it.
 
 ## Build
 

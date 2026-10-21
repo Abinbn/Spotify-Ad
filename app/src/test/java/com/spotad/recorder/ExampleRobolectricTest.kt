@@ -6,6 +6,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.spotad.recorder.audio.AudioFingerprintEngine
 import com.spotad.recorder.audio.AudioRecorderManager
 import com.spotad.recorder.audio.SpeechKeywordExtractor
+import com.spotad.recorder.audio.WavTrimmer
 import com.spotad.recorder.data.AppDatabase
 import com.spotad.recorder.data.RecordedAdEntity
 import com.spotad.recorder.data.RecordedAdRepository
@@ -17,12 +18,14 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.File
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -120,6 +123,102 @@ class ExampleRobolectricTest {
         assertTrue(withSpeech.keywords.any { it.contains("premium", ignoreCase = true) })
         assertTrue(withSpeech.themes.contains("Subscription") || withSpeech.themes.contains("Special offer"))
         assertTrue(withSpeech.transcriptSnippet.contains("three months"))
+    }
+
+
+    private fun writeTestWav(directory: File, name: String, seconds: Int, sampleRate: Int = 8_000): File {
+        val file = File(directory, name)
+        val frames = sampleRate * seconds
+        val pcm = ByteArray(frames * 2) { (it % 251).toByte() }
+        file.outputStream().use { out ->
+            out.write(AudioRecorderManager.wavHeader(pcm.size.toLong(), sampleRate))
+            out.write(pcm)
+        }
+        return file
+    }
+
+    @Test
+    fun wavInfoReportsRealDuration() {
+        val dir = File.createTempFile("spotad_wav", "").apply { delete(); mkdirs() }
+        try {
+            val file = writeTestWav(dir, "two-seconds.wav", seconds = 2)
+            val info = WavTrimmer.readInfo(file)
+            assertNotNull(info)
+            assertEquals(2_000L, info!!.durationMillis)
+            assertEquals(8_000, info.sampleRate)
+            assertEquals(16, info.bitsPerSample)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun nonWavFileIsNotTrimmed() {
+        val dir = File.createTempFile("spotad_wav_bad", "").apply { delete(); mkdirs() }
+        try {
+            val file = File(dir, "not-a-wav.wav")
+            file.writeText("this is not audio")
+            assertNull(WavTrimmer.readInfo(file))
+            assertNull(WavTrimmer.trim(file, File(dir, "out.wav"), 0, 100))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun trimProducesShorterValidWav() {
+        val dir = File.createTempFile("spotad_trim", "").apply { delete(); mkdirs() }
+        try {
+            val source = writeTestWav(dir, "source.wav", seconds = 2)
+            val destination = File(dir, "trimmed.wav")
+
+            val info = WavTrimmer.trim(source, destination, startMillis = 500, endMillis = 1_500)
+            assertNotNull(info)
+            assertEquals(1_000L, info!!.durationMillis)
+            // 1 s * 8 000 frames * 2 bytes + 44-byte header.
+            assertEquals(44L + 16_000L, destination.length())
+
+            val reread = WavTrimmer.readInfo(destination)
+            assertNotNull(reread)
+            assertEquals(8_000, reread!!.sampleRate)
+            assertEquals(1_000L, reread.durationMillis)
+            // The original must be untouched by trim().
+            assertEquals(44L + 32_000L, source.length())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun trimInPlaceReplacesFileAndKeepsItValid() {
+        val dir = File.createTempFile("spotad_trim_inplace", "").apply { delete(); mkdirs() }
+        try {
+            val file = writeTestWav(dir, "clip.wav", seconds = 3)
+            val info = WavTrimmer.trimInPlace(file, startMillis = 1_000, endMillis = 2_000)
+            assertNotNull(info)
+            assertEquals(1_000L, info!!.durationMillis)
+            assertEquals(44L + 16_000L, file.length())
+            // No temporary or backup files are left behind.
+            assertEquals(1, dir.listFiles()?.size)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun trimRangeOutsideFileIsClampedOrRejected() {
+        val dir = File.createTempFile("spotad_trim_clamp", "").apply { delete(); mkdirs() }
+        try {
+            val source = writeTestWav(dir, "short.wav", seconds = 1)
+            // Asking for a window that starts after the end must fail rather than emit junk.
+            assertNull(WavTrimmer.trim(source, File(dir, "bad.wav"), 5_000, 6_000))
+            // Asking for a window past the end is clamped to the real length.
+            val info = WavTrimmer.trim(source, File(dir, "ok.wav"), 0, 9_000)
+            assertNotNull(info)
+            assertEquals(1_000L, info!!.durationMillis)
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     @Test

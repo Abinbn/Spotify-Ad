@@ -387,6 +387,7 @@ private fun MainScreen(
             },
             onShare = { viewModel.shareAd(context, ad) },
             onExport = { exportAd(ad) },
+            onTrim = { startMillis, endMillis -> viewModel.trimAd(ad, startMillis, endMillis) },
             onDelete = { viewModel.deleteAd(ad) }
         )
     }

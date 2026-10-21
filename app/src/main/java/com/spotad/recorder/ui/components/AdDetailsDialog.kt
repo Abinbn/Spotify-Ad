@@ -15,7 +15,9 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -43,6 +45,7 @@ fun AdDetailsSheet(
     onSave: (id: Long, title: String, advertiser: String, themes: String, notes: String) -> Unit,
     onShare: () -> Unit,
     onExport: () -> Unit,
+    onTrim: (startMillis: Long, endMillis: Long) -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -54,6 +57,11 @@ fun AdDetailsSheet(
     var themes by remember(ad.id) { mutableStateOf(ad.themeTags) }
     var notes by remember(ad.id) { mutableStateOf(ad.notes) }
     var confirmDelete by remember { mutableStateOf(false) }
+    val durationSeconds = (ad.durationMillis / 1000f).coerceAtLeast(0f)
+    var trimStart by remember(ad.id, ad.durationMillis) { mutableStateOf(0f) }
+    var trimEnd by remember(ad.id, ad.durationMillis) { mutableStateOf(durationSeconds) }
+    val trimmedSeconds = (trimEnd - trimStart).coerceAtLeast(0f)
+    val selectionIsWholeClip = trimmedSeconds >= durationSeconds - 0.5f
 
     val fileSize = remember(ad.id) { File(ad.filePath).length() }
     val recordedAt = remember(ad.id) {
@@ -120,6 +128,65 @@ fun AdDetailsSheet(
                 maxLines = 4,
                 modifier = Modifier.fillMaxWidth()
             )
+
+            if (durationSeconds >= 4f) {
+                Spacer(Modifier.height(20.dp))
+                SectionLabel("TRIM")
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Cut the start or the end. The audio is copied, never re-encoded.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(4.dp))
+                RangeSlider(
+                    value = trimStart..trimEnd,
+                    onValueChange = { range ->
+                        trimStart = range.start
+                        trimEnd = range.endInclusive
+                    },
+                    valueRange = 0f..durationSeconds
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "${ExportManager.formatDuration((trimStart * 1000).toLong())} – " +
+                            ExportManager.formatDuration((trimEnd * 1000).toLong()),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = ExportManager.formatDuration((trimmedSeconds * 1000).toLong()),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            onTrim((trimStart * 1000).toLong(), (trimEnd * 1000).toLong())
+                        },
+                        enabled = !selectionIsWholeClip,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Trim to selection")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            trimStart = 0f
+                            trimEnd = durationSeconds
+                        },
+                        enabled = !selectionIsWholeClip
+                    ) {
+                        Text("Reset")
+                    }
+                }
+            }
 
             Spacer(Modifier.height(20.dp))
             SectionLabel("FILE")

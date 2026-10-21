@@ -10,6 +10,7 @@ import com.spotad.recorder.audio.AudioPlayerManager
 import com.spotad.recorder.audio.AudioRecorderManager
 import com.spotad.recorder.audio.ExportManager
 import com.spotad.recorder.audio.PlaybackState
+import com.spotad.recorder.audio.WavTrimmer
 import com.spotad.recorder.data.AppDatabase
 import com.spotad.recorder.data.AppSettings
 import com.spotad.recorder.data.RecordedAdEntity
@@ -193,6 +194,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repository.updateMetadata(id, title, advertiser, themes, notes)
             _inspectingAd.value = null
             _message.value = UiMessage("Details updated")
+        }
+    }
+
+    /**
+     * Lossless WAV trim. The row is only touched after the trimmed file is safely on disk, so a
+     * failed trim leaves the original audio and metadata exactly as they were.
+     */
+    fun trimAd(ad: RecordedAdEntity, startMillis: Long, endMillis: Long) {
+        viewModelScope.launch {
+            if (playerState.value.adId == ad.id) playerManager.stop()
+            val originalDuration = ad.durationMillis.coerceAtLeast(1L)
+            val oldBars = ad.waveform
+
+            val result = withContext(Dispatchers.IO) {
+                val file = File(ad.filePath)
+                val info = WavTrimmer.trimInPlace(file, startMillis, endMillis)
+                info?.let { it to file.length() }
+            }
+
+            if (result == null) {
+                _message.value = UiMessage(
+                    "Could not trim this recording. The original is unchanged.",
+                    isError = true
+                )
+                return@launch
+            }
+
+            val (info, size) = result
+            val waveform: List<Float> = if (oldBars.isEmpty()) {
+                emptyList()
+            } else {
+                val from = (startMillis.toFloat() / originalDuration * oldBars.size)
+                    .toInt().coerceIn(0, oldBars.lastIndex)
+                val to = (endMillis.toFloat() / originalDuration * oldBars.size)
+                    .toInt().coerceIn(from + 1, oldBars.size)
+                oldBars.subList(from, to).toList()
+            }
+
+            val updated = ad.copy(
+                durationMillis = info.durationMillis,
+                fileSizeBytes = size,
+                waveformPoints = waveform.joinToString(",")
+            )
+            repository.update(updated)
+            // Close the sheet: the confirmation snackbar lives on the main screen and would be
+            // hidden behind the modal sheet, and the list row already shows the new length.
+            if (_inspectingAd.value?.id == ad.id) _inspectingAd.value = null
+            _message.value = UiMessage("Trimmed to ${ExportManager.formatDuration(info.durationMillis)}")
         }
     }
 

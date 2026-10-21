@@ -248,12 +248,15 @@ show "No waveform data".
 - **Light / dark / system theme**.
 - **Edit metadata + notes**, copy details to clipboard.
 - **Export to Music/SpotAd** and system share with `ClipData`.
-- **Trim to recording** (implicit: capture stops at ad end).
+- **Lossless trim** — drag a start/end selection in the recording sheet; the WAV is cut by header
+  rewrite plus a byte copy, so quality is untouched and no encoder is needed. Validated by unit
+  tests (`WavTrimmer`).
 
 ### Tier 1 — next release (high value, moderate effort)
 
-1. **Trim / crop without re-encoding** — WAV makes lossless trimming trivial: pick start/end,
-   rewrite the header. Let users cut the tail of a clip that caught the next song.
+1. ~~**Trim / crop without re-encoding**~~ — **done** (`audio/WavTrimmer.kt`): frame-aligned
+   cut points, RIFF chunk walking that tolerates `LIST`/`fact` chunks, atomic swap via a temp file
+   with rollback, and refusal (not corruption) for non-PCM/non-WAV input.
 2. **Convert to MP3/AAC** — after capture, encode with `MediaCodec` (AAC in an `.m4a`) so files
    are ~10× smaller and shareable; optional "keep original" setting. This matters before users
    collect hundreds of clips.
@@ -296,6 +299,7 @@ app/src/main/java/com/spotad/recorder/
 │   ├── AudioPlayerManager.kt       focus-aware player
 │   ├── AudioFingerprintEngine.kt   weighted ad-label classifier
 │   ├── SpeechKeywordExtractor.kt   dictionary tags, no invented transcripts
+│   ├── WavTrimmer.kt               lossless frame-aligned WAV cutting
 │   └── ExportManager.kt            MediaStore export, share, formatting
 ├── data/
 │   ├── RecordedAdEntity.kt         facts + computed helpers
