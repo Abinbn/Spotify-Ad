@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-  namespace = "com.example"
+  namespace = "com.spotad.recorder"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
@@ -95,7 +95,7 @@ dependencies {
   implementation(libs.kotlinx.coroutines.core)
 
   testImplementation(libs.androidx.compose.ui.test.junit4)
-  testImplementation(libs.androidx.core)
+  testImplementation(libs.androidx.test.core)
   testImplementation(libs.androidx.junit)
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
@@ -105,7 +105,7 @@ dependencies {
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.espresso.core)
   androidTestImplementation(libs.androidx.junit)
-  androidTestImplementation(libs.androidx.runner)
+  androidTestImplementation(libs.androidx.test.runner)
 
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)

@@ -51,7 +51,7 @@ The release build uses R8 + resource shrinking. The Play upload key is read from
 ## Project layout
 
 ```
-app/src/main/java/com/example/
+app/src/main/java/com/spotad/recorder/
 ├── MainActivity.kt          single screen + permission flow
 ├── SpotAdApplication.kt
 ├── audio/                   capture, detection, playback, export

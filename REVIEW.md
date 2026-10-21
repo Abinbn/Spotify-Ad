@@ -130,9 +130,14 @@ Everything is local. No analytics, no cloud, no invented metadata.
 - The app shipped Firebase AI, App Check, Retrofit, OkHttp and Moshi — none were used, but they
   added size, network permissions and privacy-review questions. Removed, along with the
   `google-services` and `secrets` plugins and the unused `.env.example`.
-- `applicationId` changed from `com.aistudio.spotad.rxnpld` to `com.spotad.recorder`; version is
-  `1.0.0` (`versionCode 6`). **This requires a new Play listing** (the old package cannot be
-  migrated).
+- `applicationId` **and** source namespace changed from `com.aistudio.spotad.rxnpld` /
+  `com.example` to `com.spotad.recorder`; version is `1.0.0` (`versionCode 6`). **This requires a
+  new Play listing** (the old package cannot be migrated). The whole source tree moved to
+  `app/src/main/java/com/spotad/recorder/`, so no `com.example` namespace remains in the APK.
+- `gradle/libs.versions.toml` now contains only the libraries the app actually uses; the unused
+  Firebase / Retrofit / OkHttp / Moshi / CameraX / DataStore / Accompanist entries and their
+  version pins are gone. `android.enableR8.fullMode` (a no-op on AGP 8+) was removed from
+  `gradle.properties`.
 - Release builds now enable R8 + resource shrinking with Room keep rules.
 - `allowBackup` is off; only the settings file is transferred by Android's device-transfer rules.
 - The manifest no longer declares `FOREGROUND_SERVICE_MICROPHONE`; the app never records the mic.
@@ -200,9 +205,16 @@ These are not bugs; they are constraints that shape the product and the store li
 
 ## 5. What still needs a real device (cannot be verified here)
 
-This sandbox has no Android SDK, so the project could not be compiled or run. Before release:
+This sandbox has no Android SDK, so the project could not be compiled or run. What *was* checked
+statically: every Kotlin file parses without syntax errors (tree-sitter-kotlin AST, 29 files),
+every `res/**/*.xml` file is well-formed (ElementTree), every `R.string.*` key used in code
+exists in `strings.xml`, and every `libs.*` alias used by Gradle exists in the version catalog.
+That is a syntax/consistency check, **not** a compiler check — type errors can still surface on
+the first real build. Before release:
 
 - [ ] `./gradlew assembleDebug` and `bundleRelease` with the upload keystore.
+- [ ] `./gradlew testDebugUnitTest` — `app/src/test/java/com/spotad/recorder/ExampleRobolectricTest.kt`
+      covers the classifier, WAV header, keyword extraction, Room round-trip and retention rules.
 - [ ] Fresh install on Android 11, 13 and 14+ (capture and FGS rules differ).
 - [ ] Start monitoring → grant capture → play a Spotify ad → confirm the WAV plays, the library
       row matches the notification, and the saved notification appears.
@@ -212,7 +224,6 @@ This sandbox has no Android SDK, so the project could not be compiled or run. Be
 - [ ] Rotate, background-kill, and reopen the app; confirm state restoration.
 - [ ] Enable "Don't keep activities"; confirm the projection prompt returns cleanly.
 - [ ] Export on Android 9 (permission path) and Android 14 (MediaStore path).
-- [ ] Run the unit tests (`ExampleRobolectricTest`) and fix any environment-specific failures.
 - [ ] TalkBack pass, font scale 200 %, and RTL smoke test.
 - [ ] Confirm `./gradlew lint` is clean, and add a Play Data Safety declaration.
 
@@ -273,7 +284,7 @@ show "No waveform data".
 ## 7. File map after the rebuild
 
 ```
-app/src/main/java/com/example/
+app/src/main/java/com/spotad/recorder/
 ├── MainActivity.kt                 single screen, permission flow, MediaProjection launcher
 ├── SpotAdApplication.kt
 ├── audio/
