@@ -4,50 +4,21 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <group
-        android:translateX="24"
-        android:translateY="24">
-        <!-- Outer Cassette / Studio Box -->
-        <path
-            android:fillColor="#1E1E1E"
-            android:strokeColor="#1DB954"
-            android:strokeWidth="2.5"
-            android:strokeLineJoin="round"
-            android:pathData="M6,10 L54,10 A4,4 0 0,1 58,14 L58,46 A4,4 0 0,1 54,50 L6,50 A4,4 0 0,1 2,46 L2,14 A4,4 0 0,1 6,10 Z" />
-        
-        <!-- Cassette Window -->
-        <path
-            android:fillColor="#121212"
-            android:strokeColor="#333333"
-            android:strokeWidth="1.5"
-            android:pathData="M14,18 L46,18 A2,2 0 0,1 48,20 L48,34 A2,2 0 0,1 46,36 L14,36 A2,2 0 0,1 12,34 L12,20 A2,2 0 0,1 14,18 Z" />
 
-        <!-- Left Reel -->
-        <path
-            android:fillColor="#1DB954"
-            android:pathData="M22,27m-5,0a5,5 0 1,0 10,0a5,5 0 1,0 -10,0" />
-        <path
-            android:fillColor="#121212"
-            android:pathData="M22,27m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
+    <!-- Recording ring -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#E7EDF2"
+        android:strokeWidth="3.2"
+        android:pathData="M54,30 A24,24 0 1,1 53.99,30" />
 
-        <!-- Right Reel -->
-        <path
-            android:fillColor="#1DB954"
-            android:pathData="M38,27m-5,0a5,5 0 1,0 10,0a5,5 0 1,0 -10,0" />
-        <path
-            android:fillColor="#121212"
-            android:pathData="M38,27m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
+    <!-- Centre dot -->
+    <path
+        android:fillColor="#8FB0FF"
+        android:pathData="M54,43 A11,11 0 1,1 53.99,43" />
 
-        <!-- Sound Wave Bars at Bottom of tape -->
-        <path
-            android:strokeColor="#1DB954"
-            android:strokeWidth="2"
-            android:strokeLineCap="round"
-            android:pathData="M18,43 L18,45 M24,41 L24,47 M30,39 L30,47 M36,41 L36,47 M42,43 L42,45" />
-
-        <!-- Recording Indicator Dot (Red) -->
-        <path
-            android:fillColor="#FF453A"
-            android:pathData="M52,15m-3,0a3,3 0 1,0 6,0a3,3 0 1,0 -6,0" />
-    </group>
+    <!-- Sound ticks -->
+    <path
+        android:fillColor="#A3AFBA"
+        android:pathData="M27,51h3v6h-3z M33,47h3v14h-3z M72,47h3v14h-3z M78,51h3v6h-3z" />
 </vector>

@@ -1,6 +1,6 @@
 {
-  "name": "SpotAd Recorder",
-  "description": "Automatically fingerprints and records Spotify ads to MP3 with on-device speech keyword extraction and built-in studio player.",
+  "name": "SpotAd",
+  "description": "Records Spotify ad breaks on-device so you can replay, keep and share the ads you liked.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }
