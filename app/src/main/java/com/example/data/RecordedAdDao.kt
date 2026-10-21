@@ -10,25 +10,17 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface RecordedAdDao {
-    @Query("SELECT * FROM recorded_ads ORDER BY timestamp DESC")
-    fun getAllAds(): Flow<List<RecordedAdEntity>>
 
     @Query("SELECT * FROM recorded_ads ORDER BY timestamp DESC")
-    fun getAdsSortedByDateDesc(): Flow<List<RecordedAdEntity>>
-
-    @Query("SELECT * FROM recorded_ads ORDER BY timestamp ASC")
-    fun getAdsSortedByDateAsc(): Flow<List<RecordedAdEntity>>
-
-    @Query("SELECT * FROM recorded_ads ORDER BY durationMillis DESC")
-    fun getAdsSortedByDurationDesc(): Flow<List<RecordedAdEntity>>
-
-    @Query("SELECT * FROM recorded_ads ORDER BY durationMillis ASC")
-    fun getAdsSortedByDurationAsc(): Flow<List<RecordedAdEntity>>
+    fun observeAll(): Flow<List<RecordedAdEntity>>
 
     @Query("SELECT * FROM recorded_ads WHERE id = :id LIMIT 1")
-    suspend fun getAdById(id: Long): RecordedAdEntity?
+    suspend fun getById(id: Long): RecordedAdEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Query("SELECT * FROM recorded_ads")
+    suspend fun snapshot(): List<RecordedAdEntity>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insert(ad: RecordedAdEntity): Long
 
     @Update
@@ -37,41 +29,30 @@ interface RecordedAdDao {
     @Delete
     suspend fun delete(ad: RecordedAdEntity)
 
-    @Query("DELETE FROM recorded_ads WHERE id = :id")
-    suspend fun deleteById(id: Long)
+    @Query("UPDATE recorded_ads SET isFavorite = :isFavorite WHERE id = :id")
+    suspend fun setFavorite(id: Long, isFavorite: Boolean)
 
-    @Query("UPDATE recorded_ads SET isFavorite = :isFav WHERE id = :id")
-    suspend fun updateFavorite(id: Long, isFav: Boolean)
+    @Query(
+        "UPDATE recorded_ads SET title = :title, advertiser = :advertiser, " +
+            "themeTags = :themes, notes = :notes WHERE id = :id"
+    )
+    suspend fun updateMetadata(id: Long, title: String, advertiser: String, themes: String, notes: String)
 
-    @Query("UPDATE recorded_ads SET title = :newTitle, advertiser = :newAdvertiser, themeTags = :newThemes WHERE id = :id")
-    suspend fun updateMetadata(id: Long, newTitle: String, newAdvertiser: String, newThemes: String)
+    @Query("SELECT * FROM recorded_ads WHERE timestamp < :cutoff AND isFavorite = 0")
+    suspend fun olderThan(cutoff: Long): List<RecordedAdEntity>
 
-    // Automated 30-Day Cleanup Queries (exempting Favorites)
-    @Query("SELECT * FROM recorded_ads WHERE timestamp < :cutoffTimestamp AND isFavorite = 0")
-    suspend fun getOldNonFavoriteAds(cutoffTimestamp: Long): List<RecordedAdEntity>
+    @Query("DELETE FROM recorded_ads WHERE timestamp < :cutoff AND isFavorite = 0")
+    suspend fun deleteOlderThan(cutoff: Long): Int
 
-    @Query("DELETE FROM recorded_ads WHERE timestamp < :cutoffTimestamp AND isFavorite = 0")
-    suspend fun deleteOldNonFavoriteAds(cutoffTimestamp: Long): Int
-
-    @Query("SELECT COUNT(*) FROM recorded_ads WHERE timestamp < :cutoffTimestamp AND isFavorite = 0")
-    suspend fun countOldNonFavoriteAds(cutoffTimestamp: Long): Int
-
-    // Purge any demo/sample recordings
-    @Query("SELECT * FROM recorded_ads WHERE filePath LIKE '%sample%' OR title LIKE '%Free Premium%'")
-    suspend fun getSampleAds(): List<RecordedAdEntity>
-
-    @Query("DELETE FROM recorded_ads WHERE filePath LIKE '%sample%' OR title LIKE '%Free Premium%'")
-    suspend fun deleteSampleAds(): Int
+    @Query("SELECT COUNT(*) FROM recorded_ads WHERE timestamp < :cutoff AND isFavorite = 0")
+    suspend fun countOlderThan(cutoff: Long): Int
 
     @Query("SELECT * FROM recorded_ads WHERE isFavorite = 0")
-    suspend fun getAllNonFavoriteAds(): List<RecordedAdEntity>
+    suspend fun nonFavorites(): List<RecordedAdEntity>
 
     @Query("DELETE FROM recorded_ads WHERE isFavorite = 0")
-    suspend fun deleteAllNonFavoriteAds(): Int
-
-    @Query("SELECT * FROM recorded_ads")
-    suspend fun getAllAdsSnapshot(): List<RecordedAdEntity>
+    suspend fun deleteNonFavorites(): Int
 
     @Query("DELETE FROM recorded_ads")
-    suspend fun deleteAllAds(): Int
+    suspend fun deleteAll(): Int
 }

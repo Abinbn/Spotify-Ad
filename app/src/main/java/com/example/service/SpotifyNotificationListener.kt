@@ -15,235 +15,37 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
 import com.example.audio.AudioFingerprintEngine
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
+/**
+ * Reads Spotify's media session (and, as a fallback, its notification) to know what is playing.
+ *
+ * The media session is the authoritative source: it exposes a real [PlaybackState], so we no
+ * longer guess "playing" from the label of a notification button. Events are de-duplicated so a
+ * burst of notification updates cannot start or stop a capture repeatedly.
+ */
 class SpotifyNotificationListener : NotificationListenerService() {
 
-    private val tag = "SpotifyNotifListener"
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var activeSessionsListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
+    private var controllerCallback: MediaController.Callback? = null
+    private var boundController: MediaController? = null
+    private var stopCheckJob: Job? = null
 
-    private var mediaSessionManager: MediaSessionManager? = null
-    private var activeSessionsChangedListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
-    private val registeredSpotifyControllers = mutableMapOf<String, MediaController>()
-
-    companion object {
-        var instance: SpotifyNotificationListener? = null
-            private set
-
-        fun isNotificationAccessGranted(context: Context): Boolean {
-            try {
-                val enabledPackages = NotificationManagerCompat.getEnabledListenerPackages(context)
-                if (enabledPackages.contains(context.packageName)) {
-                    return true
-                }
-            } catch (e: Exception) {
-                Log.w("SpotifyNotifListener", "Failed checking NotificationManagerCompat: ${e.message}")
-            }
-
-            val enabledListeners = Settings.Secure.getString(
-                context.contentResolver,
-                "enabled_notification_listeners"
-            ) ?: return false
-            val myComponent = ComponentName(context, SpotifyNotificationListener::class.java).flattenToString()
-            return enabledListeners.contains(myComponent) || enabledListeners.contains(context.packageName)
-        }
-
-        fun rebindIfPossible(context: Context) {
-            if (!isNotificationAccessGranted(context)) return
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                try {
-                    requestRebind(ComponentName(context, SpotifyNotificationListener::class.java))
-                    Log.d("SpotifyNotifListener", "Requested listener rebind")
-                } catch (e: Exception) {
-                    Log.w("SpotifyNotifListener", "Could not request rebind: ${e.message}")
-                }
-            }
-
-            // If listener instance is not bound yet, toggle component to force OS to rebind
-            if (instance == null) {
-                try {
-                    val comp = ComponentName(context, SpotifyNotificationListener::class.java)
-                    val pm = context.packageManager
-                    pm.setComponentEnabledSetting(
-                        comp,
-                        android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                        android.content.pm.PackageManager.DONT_KILL_APP
-                    )
-                    pm.setComponentEnabledSetting(
-                        comp,
-                        android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                        android.content.pm.PackageManager.DONT_KILL_APP
-                    )
-                    Log.d("SpotifyNotifListener", "Toggled listener component to force rebind")
-                } catch (e: Exception) {
-                    Log.w("SpotifyNotifListener", "Could not toggle component: ${e.message}")
-                }
-            }
-        }
-
-        /**
-         * Checks active MediaSessions directly from Context if notification access is granted.
-         */
-        fun queryActiveSpotifyMediaSession(context: Context): Boolean {
-            if (!isNotificationAccessGranted(context)) return false
-            try {
-                val msm = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager ?: return false
-                val component = ComponentName(context, SpotifyNotificationListener::class.java)
-                val sessions = msm.getActiveSessions(component)
-                for (controller in sessions) {
-                    if (controller.packageName.contains("spotify", ignoreCase = true)) {
-                        dispatchFromMediaController(context, controller, "MediaSessionManager query")
-                        return true
-                    }
-                }
-            } catch (e: SecurityException) {
-                Log.w("SpotifyNotifListener", "SecurityException querying MediaSessions: ${e.message}")
-            } catch (e: Exception) {
-                Log.w("SpotifyNotifListener", "Error querying MediaSessions: ${e.message}")
-            }
-            return false
-        }
-
-        fun dispatchFromMediaController(
-            context: Context,
-            controller: MediaController,
-            source: String
-        ) {
-            val metadata = controller.metadata
-            val pbState = controller.playbackState
-
-            var title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)?.trim()
-                ?: metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)?.trim()
-                ?: ""
-            var artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST)?.trim()
-                ?: metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)?.trim()
-                ?: metadata?.getString(MediaMetadata.METADATA_KEY_AUTHOR)?.trim()
-                ?: metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE)?.trim()
-                ?: ""
-            val album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM)?.trim()
-                ?: metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION)?.trim()
-                ?: ""
-            val durationMs = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
-            val positionMs = pbState?.position ?: 0L
-            val isPlaying = pbState?.state == PlaybackState.STATE_PLAYING ||
-                    pbState?.state == PlaybackState.STATE_BUFFERING ||
-                    pbState?.state == PlaybackState.STATE_FAST_FORWARDING ||
-                    pbState?.state == PlaybackState.STATE_REWINDING
-
-            if (title.isBlank() && artist.isBlank()) {
-                // If title is blank, but it's Spotify playing, use fallback
-                if (isPlaying) {
-                    title = "Spotify Active Audio"
-                    artist = "Spotify"
-                } else {
-                    return
-                }
-            }
-
-            val fingerprint = AudioFingerprintEngine.evaluateAdBreak(
-                trackId = null,
-                trackTitle = title,
-                artist = artist,
-                lengthMillis = if (durationMs > 0) durationMs else 30_000L
-            )
-
-            val isAd = fingerprint.isAdBreak ||
-                    title.contains("advertis", ignoreCase = true) ||
-                    artist.contains("advertis", ignoreCase = true) ||
-                    title.equals("advertisement", ignoreCase = true) ||
-                    title.equals("ad", ignoreCase = true)
-
-            val contentType = when {
-                isAd -> "Advertisement"
-                durationMs > 600_000L || album.contains("podcast", ignoreCase = true) || title.contains("episode", ignoreCase = true) -> "Podcast Episode"
-                else -> "Music Track"
-            }
-
-            val event = SpotifyAdEvent(
-                trackId = null,
-                trackTitle = if (title.isBlank() && isAd) "Spotify Commercial" else title,
-                artist = if (artist.isBlank() && isAd) "Spotify Sponsor" else artist,
-                album = album,
-                lengthMillis = durationMs,
-                currentPositionMillis = positionMs,
-                isPlaying = isPlaying,
-                isAdBreak = isAd,
-                confidence = if (isAd) maxOf(fingerprint.confidence, 0.92f) else fingerprint.confidence,
-                source = source,
-                contentType = contentType,
-                timestamp = pbState?.lastPositionUpdateTime.takeIf { it != null && it > 0 } ?: System.currentTimeMillis()
-            )
-
-            AdRecordingService.dispatchSpotifyEvent(context, event)
-        }
-    }
+    private var lastSignature: String = ""
+    private var lastDispatchAt: Long = 0L
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = this
-        Log.i(tag, "SpotifyNotificationListener connected to notification subsystem")
-
-        // Register MediaSession active sessions listener
+        Log.i(TAG, "Notification listener connected")
         setupMediaSessionMonitoring()
-
-        // Check currently active notifications
-        checkActiveSpotifyNotifications()
-    }
-
-    private fun setupMediaSessionMonitoring() {
-        try {
-            mediaSessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
-            val component = ComponentName(this, SpotifyNotificationListener::class.java)
-
-            activeSessionsChangedListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-                Log.d(tag, "Active media sessions changed: ${controllers?.size} sessions")
-                inspectMediaControllers(controllers)
-            }
-
-            mediaSessionManager?.addOnActiveSessionsChangedListener(
-                activeSessionsChangedListener!!,
-                component
-            )
-
-            // Inspect currently active sessions
-            val sessions = mediaSessionManager?.getActiveSessions(component)
-            inspectMediaControllers(sessions)
-        } catch (e: Exception) {
-            Log.w(tag, "Could not set up MediaSessionManager listener: ${e.message}")
-        }
-    }
-
-    private fun inspectMediaControllers(controllers: List<MediaController>?) {
-        if (controllers == null) return
-        for (controller in controllers) {
-            val pkg = controller.packageName ?: continue
-            if (pkg.contains("spotify", ignoreCase = true)) {
-                Log.i(tag, "Found active Spotify MediaController: $pkg")
-                dispatchFromMediaController(applicationContext, controller, "MediaSession: $pkg")
-
-                // Register real-time callback if not already registered
-                val sessionTokenKey = controller.sessionToken.toString()
-                if (!registeredSpotifyControllers.containsKey(sessionTokenKey)) {
-                    registeredSpotifyControllers[sessionTokenKey] = controller
-                    controller.registerCallback(object : MediaController.Callback() {
-                        override fun onMetadataChanged(metadata: MediaMetadata?) {
-                            Log.d(tag, "Spotify MediaController: metadata changed")
-                            dispatchFromMediaController(applicationContext, controller, "MediaSession MetadataChanged")
-                        }
-
-                        override fun onPlaybackStateChanged(state: PlaybackState?) {
-                            Log.d(tag, "Spotify MediaController: playback state changed -> ${state?.state}")
-                            dispatchFromMediaController(applicationContext, controller, "MediaSession PlaybackStateChanged")
-                        }
-
-                        override fun onSessionDestroyed() {
-                            Log.d(tag, "Spotify MediaController: session destroyed")
-                            registeredSpotifyControllers.remove(sessionTokenKey)
-                            AdRecordingService.dispatchSpotifyStopped(applicationContext)
-                        }
-                    })
-                }
-            }
-        }
+        inspectActiveNotifications()
     }
 
     override fun onListenerDisconnected() {
@@ -257,188 +59,324 @@ class SpotifyNotificationListener : NotificationListenerService() {
     }
 
     private fun cleanup() {
-        if (instance == this) instance = null
-        try {
-            activeSessionsChangedListener?.let {
-                mediaSessionManager?.removeOnActiveSessionsChangedListener(it)
+        if (instance === this) instance = null
+        activeSessionsListener?.let { listener ->
+            try {
+                mediaSessionManager()?.removeOnActiveSessionsChangedListener(listener)
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {}
-        registeredSpotifyControllers.clear()
+        }
+        activeSessionsListener = null
+        controllerCallback?.let { callback ->
+            try {
+                boundController?.unregisterCallback(callback)
+            } catch (_: Exception) {
+            }
+        }
+        controllerCallback = null
+        boundController = null
     }
 
-    fun checkActiveSpotifyNotifications() {
+    private fun mediaSessionManager(): MediaSessionManager? =
+        getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
+
+    private fun setupMediaSessionMonitoring() {
         try {
-            // Check active status bar notifications
-            val activeNotifs = try { activeNotifications } catch (_: Exception) { null }
-            if (activeNotifs != null) {
-                val spotifyNotifs = activeNotifs.filter {
-                    it.packageName?.contains("spotify", ignoreCase = true) == true
-                }
-                val mediaNotif = spotifyNotifs.firstOrNull { sbn ->
-                    val extras = sbn.notification?.extras
-                    extras != null && (extras.containsKey(Notification.EXTRA_MEDIA_SESSION) ||
-                            !extras.getCharSequence(Notification.EXTRA_TITLE).isNullOrBlank())
-                } ?: spotifyNotifs.firstOrNull()
+            val manager = mediaSessionManager() ?: return
+            val component = ComponentName(this, SpotifyNotificationListener::class.java)
 
-                if (mediaNotif != null) {
-                    processSpotifyNotification(mediaNotif)
-                }
+            val listener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+                bindControllers(controllers)
             }
-
-            // Also check active media sessions directly
-            mediaSessionManager?.let { msm ->
-                val component = ComponentName(this, SpotifyNotificationListener::class.java)
-                val sessions = msm.getActiveSessions(component)
-                inspectMediaControllers(sessions)
-            }
+            activeSessionsListener = listener
+            manager.addOnActiveSessionsChangedListener(listener, component)
+            bindControllers(manager.getActiveSessions(component))
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Notification access is missing or was revoked", e)
         } catch (e: Exception) {
-            Log.e(tag, "Error inspecting active Spotify notifications or sessions", e)
+            Log.w(TAG, "Could not set up media session monitoring", e)
+        }
+    }
+
+    private fun bindControllers(controllers: List<MediaController>?) {
+        controllers ?: return
+        val spotifyController = controllers.firstOrNull { isSpotifyPackage(it.packageName) }
+        if (spotifyController == null) return
+
+        if (boundController?.sessionToken != spotifyController.sessionToken) {
+            controllerCallback?.let { callback ->
+                try {
+                    boundController?.unregisterCallback(callback)
+                } catch (_: Exception) {
+                }
+            }
+            val callback = object : MediaController.Callback() {
+                override fun onMetadataChanged(metadata: MediaMetadata?) {
+                    publishFromController(spotifyController, "Spotify media session")
+                }
+
+                override fun onPlaybackStateChanged(state: PlaybackState?) {
+                    if (state?.state == PlaybackState.STATE_STOPPED) {
+                        AdRecordingService.dispatchPlaybackStopped()
+                    } else {
+                        publishFromController(spotifyController, "Spotify media session")
+                    }
+                }
+
+                override fun onSessionDestroyed() {
+                    AdRecordingService.dispatchPlaybackStopped()
+                }
+            }
+            try {
+                spotifyController.registerCallback(callback)
+                controllerCallback = callback
+                boundController = spotifyController
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not observe the Spotify session", e)
+            }
+        }
+
+        publishFromController(spotifyController, "Spotify media session")
+    }
+
+    private fun publishFromController(controller: MediaController, source: String) {
+        val metadata = try {
+            controller.metadata
+        } catch (_: Exception) {
+            null
+        }
+        val playbackState = try {
+            controller.playbackState
+        } catch (_: Exception) {
+            null
+        }
+
+        var title = metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)?.trim()
+            ?: metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)?.trim()
+            ?: ""
+        var artist = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST)?.trim()
+            ?: metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)?.trim()
+            ?: metadata?.getString(MediaMetadata.METADATA_KEY_AUTHOR)?.trim()
+            ?: metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE)?.trim()
+            ?: ""
+        val album = metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM)?.trim()
+            ?: metadata?.getString(MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION)?.trim()
+            ?: ""
+        val duration = metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+        val position = playbackState?.position ?: 0L
+        val isPlaying = playbackState?.state == PlaybackState.STATE_PLAYING ||
+            playbackState?.state == PlaybackState.STATE_BUFFERING
+
+        if (title.isBlank() && artist.isBlank()) return
+        if (!isPlaying && title.isBlank()) return
+
+        if (title.isBlank()) {
+            // Some Spotify builds expose only the advertiser for ads.
+            title = artist
+            artist = ""
+        }
+
+        publish(title, artist, album, duration, position, isPlaying, source)
+    }
+
+    private fun inspectActiveNotifications() {
+        try {
+            val notifications = activeNotifications ?: return
+            notifications
+                .filter { isSpotifyPackage(it.packageName) }
+                .firstOrNull { it.notification?.extras?.containsKey(Notification.EXTRA_MEDIA_SESSION) == true }
+                ?.let { processNotification(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not inspect active notifications", e)
         }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn == null) return
-        val packageName = sbn.packageName ?: return
-
-        if (!packageName.contains("spotify", ignoreCase = true)) {
-            return
-        }
-
-        if (AdRecordingService.isTravelMode(applicationContext)) {
-            Log.d(tag, "Travel Mode active: Ignoring notification")
-            return
-        }
-
-        processSpotifyNotification(sbn)
+        val notification = sbn ?: return
+        if (!isSpotifyPackage(notification.packageName)) return
+        processNotification(notification)
     }
 
-    private fun processSpotifyNotification(sbn: StatusBarNotification) {
+    private fun processNotification(sbn: StatusBarNotification) {
         val notification = sbn.notification ?: return
         val extras = notification.extras ?: return
 
-        var title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
-            ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.trim()
-            ?: ""
-        var artist = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim()
-            ?: extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()?.trim()
-            ?: ""
-        var album = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()?.trim() ?: ""
-        var durationMs = 0L
-        var positionMs = 0L
-        var isPlaying = true
-
-        // Detect playing vs paused from notification action buttons (Play vs Pause action)
-        val actions = notification.actions
-        if (actions != null) {
-            for (action in actions) {
-                val actTitle = action.title?.toString() ?: ""
-                if (actTitle.contains("pause", ignoreCase = true)) {
-                    isPlaying = true
-                } else if (actTitle.contains("play", ignoreCase = true)) {
-                    isPlaying = false
-                }
-            }
-        }
-
-        // Try extracting high-fidelity metadata from MediaSession Token
-        try {
-            val token = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        // Prefer the media session token: it gives us the real playback state.
+        val token = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 extras.getParcelable(Notification.EXTRA_MEDIA_SESSION, MediaSession.Token::class.java)
             } else {
                 @Suppress("DEPRECATION")
                 extras.getParcelable(Notification.EXTRA_MEDIA_SESSION) as? MediaSession.Token
             }
+        } catch (_: Exception) {
+            null
+        }
 
-            if (token != null) {
-                val controller = MediaController(applicationContext, token)
-                val pbState = controller.playbackState
-                if (pbState != null) {
-                    isPlaying = pbState.state == PlaybackState.STATE_PLAYING ||
-                            pbState.state == PlaybackState.STATE_BUFFERING ||
-                            pbState.state == PlaybackState.STATE_FAST_FORWARDING ||
-                            pbState.state == PlaybackState.STATE_REWINDING
-                    positionMs = pbState.position
-                }
-
-                val metadata = controller.metadata
-                if (metadata != null) {
-                    val mediaTitle = metadata.getString(MediaMetadata.METADATA_KEY_TITLE)
-                        ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)
-                    val mediaArtist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST)
-                        ?: metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
-                        ?: metadata.getString(MediaMetadata.METADATA_KEY_AUTHOR)
-                    val mediaAlbum = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM)
-                        ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION)
-                    val mediaDuration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
-
-                    if (!mediaTitle.isNullOrBlank()) title = mediaTitle
-                    if (!mediaArtist.isNullOrBlank()) artist = mediaArtist
-                    if (!mediaAlbum.isNullOrBlank()) album = mediaAlbum
-                    if (mediaDuration > 0) durationMs = mediaDuration
-                }
+        if (token != null) {
+            try {
+                publishFromController(MediaController(applicationContext, token), "Spotify notification")
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not read the notification's media session", e)
             }
-        } catch (e: Exception) {
-            Log.w(tag, "Could not extract MediaController metadata from notification", e)
         }
 
-        if (title.isBlank() && artist.isBlank()) {
-            return
+        var title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        var artist = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        val album = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()?.trim().orEmpty()
+        if (title.isBlank()) {
+            title = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.trim().orEmpty()
         }
+        if (title.isBlank() && artist.isBlank()) return
 
-        Log.d(tag, "Spotify Notification detected: title='$title', artist='$artist', album='$album', duration=${durationMs}ms, pos=${positionMs}ms, isPlaying=$isPlaying")
+        val isPlaying = inferPlayingFromActions(notification) ?: true
+        publish(title, artist, album, 0L, 0L, isPlaying, "Spotify notification")
+    }
 
-        // Check if this is an ad
+    private fun inferPlayingFromActions(notification: Notification): Boolean? {
+        val labels = notification.actions
+            ?.mapNotNull { it.title?.toString()?.lowercase() }
+            .orEmpty()
+        return when {
+            labels.any { it.contains("pause") } -> true
+            labels.any { it.contains("play") || it.contains("resume") } -> false
+            else -> null
+        }
+    }
+
+    private fun publish(
+        title: String,
+        artist: String,
+        album: String,
+        durationMillis: Long,
+        positionMillis: Long,
+        isPlaying: Boolean,
+        source: String
+    ) {
+        val signature = "$title|$artist|$album|$isPlaying|$durationMillis"
+        val now = System.currentTimeMillis()
+        if (signature == lastSignature && now - lastDispatchAt < DEDUPE_WINDOW_MS) return
+        lastSignature = signature
+        lastDispatchAt = now
+
         val fingerprint = AudioFingerprintEngine.evaluateAdBreak(
             trackId = null,
             trackTitle = title,
             artist = artist,
-            lengthMillis = if (durationMs > 0) durationMs else 30_000L
+            lengthMillis = durationMillis
         )
-
-        val isAd = fingerprint.isAdBreak ||
-                title.contains("advertis", ignoreCase = true) ||
-                artist.contains("advertis", ignoreCase = true) ||
-                title.equals("advertisement", ignoreCase = true) ||
-                title.equals("ad", ignoreCase = true)
-
-        val contentType = when {
-            isAd -> "Advertisement"
-            durationMs > 600_000L || album.contains("podcast", ignoreCase = true) || title.contains("episode", ignoreCase = true) -> "Podcast Episode"
-            else -> "Music Track"
+        val kind = when (
+            AudioFingerprintEngine.classify(fingerprint.isAdBreak, title, album, durationMillis)
+        ) {
+            AudioFingerprintEngine.ContentType.ADVERTISEMENT -> ContentKind.AD
+            AudioFingerprintEngine.ContentType.PODCAST -> ContentKind.PODCAST
+            AudioFingerprintEngine.ContentType.MUSIC -> ContentKind.MUSIC
+            else -> ContentKind.UNKNOWN
         }
 
-        val event = SpotifyAdEvent(
-            trackId = null,
-            trackTitle = if (title.isBlank() && isAd) "Spotify Commercial" else title,
-            artist = if (artist.isBlank() && isAd) "Spotify Sponsor" else artist,
-            album = album,
-            lengthMillis = durationMs,
-            currentPositionMillis = positionMs,
-            isPlaying = isPlaying,
-            isAdBreak = isAd,
-            confidence = if (isAd) maxOf(fingerprint.confidence, 0.92f) else fingerprint.confidence,
-            source = "Spotify Notification",
-            contentType = contentType,
-            timestamp = sbn.postTime.takeIf { it > 0 } ?: System.currentTimeMillis()
+        AdRecordingService.dispatchEvent(
+            SpotifyAdEvent(
+                trackId = null,
+                title = title,
+                artist = artist,
+                album = album,
+                durationMillis = durationMillis,
+                positionMillis = positionMillis,
+                isPlaying = isPlaying,
+                isAd = fingerprint.isAdBreak,
+                confidence = fingerprint.confidence,
+                source = source,
+                kind = kind
+            )
         )
-
-        AdRecordingService.dispatchSpotifyEvent(applicationContext, event)
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        val pkg = sbn?.packageName ?: return
-        if (pkg.contains("spotify", ignoreCase = true)) {
-            Log.d(tag, "Spotify notification dismissed")
-            // Check if there is still an active media session before declaring stopped
+        val packageName = sbn?.packageName ?: return
+        if (!isSpotifyPackage(packageName)) return
+
+        // The notification disappears when playback stops or Spotify is swiped away. Confirm
+        // against the media session before telling the recorder to stop.
+        stopCheckJob?.cancel()
+        stopCheckJob = scope.launch {
+            delay(700)
+            val stillPlaying = try {
+                val manager = mediaSessionManager()
+                val component = ComponentName(this@SpotifyNotificationListener, SpotifyNotificationListener::class.java)
+                manager?.getActiveSessions(component)
+                    ?.any { isSpotifyPackage(it.packageName) && it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                    ?: false
+            } catch (_: Exception) {
+                false
+            }
+            if (!stillPlaying) AdRecordingService.dispatchPlaybackStopped()
+        }
+    }
+
+    companion object {
+        private const val TAG = "SpotifyNotifListener"
+        private const val DEDUPE_WINDOW_MS = 750L
+
+        private val SPOTIFY_PACKAGES = setOf("com.spotify.music", "com.spotify.lite")
+
+        @Volatile
+        var instance: SpotifyNotificationListener? = null
+            private set
+
+        fun isSpotifyPackage(packageName: String?): Boolean {
+            val name = packageName ?: return false
+            return name in SPOTIFY_PACKAGES || name.startsWith("com.spotify.")
+        }
+
+        fun hasAccess(context: Context): Boolean {
+            val enabled = try {
+                NotificationManagerCompat.getEnabledListenerPackages(context)
+            } catch (_: Exception) {
+                emptySet<String>()
+            }
+            if (enabled.contains(context.packageName)) return true
+
+            val listeners = try {
+                Settings.Secure.getString(
+                    context.contentResolver,
+                    "enabled_notification_listeners"
+                )
+            } catch (_: Exception) {
+                null
+            } ?: return false
+
+            val component = ComponentName(context, SpotifyNotificationListener::class.java)
+            return listeners.contains(component.flattenToString()) ||
+                listeners.contains(component.flattenToShortString()) ||
+                listeners.contains(context.packageName)
+        }
+
+        /** Asks the system to rebind the listener after the user returns from Settings. */
+        fun requestRebind(context: Context) {
+            if (!hasAccess(context) || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
             try {
-                val component = ComponentName(this, SpotifyNotificationListener::class.java)
-                val sessions = mediaSessionManager?.getActiveSessions(component)
-                val hasSpotify = sessions?.any { it.packageName.contains("spotify", ignoreCase = true) && it.playbackState?.state == PlaybackState.STATE_PLAYING } == true
-                if (!hasSpotify) {
-                    AdRecordingService.dispatchSpotifyStopped(applicationContext)
-                }
+                NotificationListenerService.requestRebind(
+                    ComponentName(context, SpotifyNotificationListener::class.java)
+                )
             } catch (e: Exception) {
-                AdRecordingService.dispatchSpotifyStopped(applicationContext)
+                Log.w(TAG, "Rebind request failed", e)
+            }
+        }
+
+        /** Reads the current Spotify state once, for when the app comes back to the foreground. */
+        fun refreshNowPlaying(context: Context) {
+            if (!hasAccess(context)) return
+            try {
+                val manager = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
+                    ?: return
+                val component = ComponentName(context, SpotifyNotificationListener::class.java)
+                val controller = manager.getActiveSessions(component)
+                    .firstOrNull { isSpotifyPackage(it.packageName) }
+                    ?: return
+                instance?.publishFromController(controller, "Spotify media session")
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not refresh the Spotify state", e)
             }
         }
     }

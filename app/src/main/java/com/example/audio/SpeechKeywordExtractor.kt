@@ -3,9 +3,12 @@ package com.example.audio
 import java.util.Locale
 
 /**
- * On-device speech recognition and semantic keyword/theme tagger.
- * Identifies spoken commercial keywords, calls-to-action, offers,
- * and classifies the ad into distinct themes.
+ * Turns the text we actually have (the Spotify ad title / advertiser, plus recognised speech when
+ * available) into a few useful keywords and theme tags.
+ *
+ * It is a dictionary matcher, not a language model, and it never invents a transcript. If no
+ * speech recognition result exists, [ExtractedMetadata.transcriptSnippet] is empty and the UI
+ * shows "No transcript available".
  */
 object SpeechKeywordExtractor {
 
@@ -15,93 +18,70 @@ object SpeechKeywordExtractor {
         val transcriptSnippet: String
     )
 
-    // Commercial keyword dictionary categorized by marketing intent
-    private val THEME_RULES = mapOf(
-        "Special Offer" to listOf("50%", "discount", "save", "deal", "offer", "free trial", "promo code", "sale", "limited time", "cashback"),
-        "Subscription" to listOf("premium", "unlimited", "stream", "subscribe", "monthly", "cancel anytime", "family plan", "upgrade", "student"),
-        "Catchy Jingle" to listOf("jingle", "tune", "sing", "music", "rhythm", "melody", "catchy", "sound of", "listen up"),
-        "Food & Dining" to listOf("burger", "pizza", "coffee", "fresh", "taste", "delicious", "crave", "order now", "delivery", "restaurant", "snack"),
-        "Tech & Mobile" to listOf("app", "download", "smartphone", "5g", "cloud", "gaming", "fast", "device", "stream", "software"),
-        "Fashion & Retail" to listOf("shoes", "outfit", "style", "wardrobe", "collection", "shop", "trends", "wear"),
-        "Automotive & Travel" to listOf("drive", "engine", "trip", "car", "flight", "road", "wheels", "destination", "hotel")
+    private val THEME_RULES: List<Pair<String, List<String>>> = listOf(
+        "Special offer" to listOf("discount", "save", "deal", "offer", "free", "promo", "sale", "% off", "cashback", "coupon"),
+        "Subscription" to listOf("premium", "subscribe", "subscription", "unlimited", "monthly", "cancel anytime", "family plan", "student plan"),
+        "Food & drink" to listOf("burger", "pizza", "coffee", "restaurant", "delivery", "taste", "menu", "snack", "drink", "brew"),
+        "Tech & mobile" to listOf("app", "download", "smartphone", "5g", "cloud", "software", "device", "wifi", "phone"),
+        "Fashion & retail" to listOf("collection", "outfit", "style", "shoes", "wardrobe", "shop", "wear", "brand"),
+        "Automotive & travel" to listOf("car", "drive", "engine", "flight", "hotel", "trip", "destination", "insurance"),
+        "Entertainment" to listOf("movie", "series", "stream", "watch", "game", "tickets", "concert"),
+        "Health & fitness" to listOf("workout", "fitness", "health", "gym", "vitamin", "sleep", "therapy"),
+        "Finance" to listOf("bank", "credit card", "loan", "invest", "save money", "crypto", "insurance")
     )
 
-    private val COMMON_AD_PHRASES = listOf(
-        "Tap the banner to learn more",
-        "Get three months of Spotify Premium for free",
-        "Enjoy your music without ad interruptions",
-        "Order your favorite meals with fast local delivery",
-        "Upgrade your style with our brand new seasonal collection",
-        "Save up to 50% on all plans when you sign up today",
-        "Soundtrack your day with high fidelity audio streaming",
-        "Don't miss out on our limited time weekend special offer",
-        "Download the app now on Google Play",
-        "Experience the next generation of performance and comfort"
+    private val STOP_WORDS = setOf(
+        "the", "and", "for", "with", "your", "you", "our", "this", "that", "from", "now",
+        "get", "new", "all", "are", "was", "have", "has", "will", "can", "just", "spotify"
     )
 
-    /**
-     * Extracts spoken keywords, themes, and transcript for an ad clip.
-     * Uses title, advertiser, duration, and optional recognized text.
-     */
     fun extract(
         title: String,
         advertiser: String,
         durationMillis: Long,
         speechRecognizedText: String? = null
     ): ExtractedMetadata {
-        val fullText = buildString {
-            if (!speechRecognizedText.isNullOrBlank()) {
-                append(speechRecognizedText).append(" ")
-            }
-            append(title).append(" ").append(advertiser)
-        }.lowercase(Locale.ROOT)
+        val transcript = speechRecognizedText?.trim().orEmpty()
+        val available = buildString {
+            if (transcript.isNotEmpty()) append(transcript).append(' ')
+            append(title).append(' ').append(advertiser)
+        }
+        val haystack = available.lowercase(Locale.ROOT)
 
-        val detectedKeywords = mutableSetOf<String>()
-        val detectedThemes = mutableSetOf<String>()
+        val themes = linkedSetOf<String>()
+        val keywords = linkedSetOf<String>()
 
-        // Check against theme rule keywords
-        for ((theme, triggerWords) in THEME_RULES) {
-            for (word in triggerWords) {
-                if (fullText.contains(word.lowercase(Locale.ROOT))) {
-                    detectedKeywords.add(word)
-                    detectedThemes.add(theme)
-                }
+        for ((theme, triggers) in THEME_RULES) {
+            val matched = triggers.filter { trigger -> haystack.contains(trigger) }
+            if (matched.isNotEmpty()) {
+                themes += theme
+                matched.take(2).forEach { keywords += it }
             }
         }
 
-        // Default keywords if none specifically matched
-        if (detectedKeywords.isEmpty()) {
-            if (durationMillis <= 15_000) {
-                detectedKeywords.add("15s Quick Ad")
-                detectedThemes.add("Short Bumper")
-            } else {
-                detectedKeywords.add("Audio Commercial")
-                detectedThemes.add("Sponsored Audio")
-            }
-            if (advertiser.isNotBlank() && advertiser.lowercase() != "spotify") {
-                detectedKeywords.add(advertiser)
-            }
+        // Prefer words that look like campaign-specific copy over the generic title words.
+        if (transcript.isNotEmpty()) {
+            transcript.split(Regex("[^A-Za-z0-9&'%]+"))
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.length in 3..18 }
+                .filter { it.lowercase(Locale.ROOT) !in STOP_WORDS }
+                .take(8)
+                .forEach { keywords += it }
         }
 
-        if (detectedThemes.isEmpty()) {
-            detectedThemes.add("General Ad")
+        if (keywords.isEmpty() && title.isNotBlank()) {
+            keywords += title.trim().take(40)
         }
 
-        // Determine or generate realistic transcript snippet
-        val snippet = if (!speechRecognizedText.isNullOrBlank()) {
-            speechRecognizedText.trim()
-        } else {
-            // Match closest plausible commercial transcript based on advertiser/keywords
-            val matchingPhrase = COMMON_AD_PHRASES.firstOrNull { phrase ->
-                detectedKeywords.any { kw -> phrase.contains(kw, ignoreCase = true) }
-            } ?: "Spoken audio ad for $advertiser: \"$title\" (${durationMillis / 1000}s commercial break)."
-            matchingPhrase
+        if (themes.isEmpty() && durationMillis in 1..20_000) {
+            themes += "Short spot"
         }
 
         return ExtractedMetadata(
-            keywords = detectedKeywords.take(6).toList(),
-            themes = detectedThemes.take(3).toList(),
-            transcriptSnippet = snippet
+            keywords = keywords.take(6).toList(),
+            themes = themes.take(3).toList(),
+            transcriptSnippet = transcript.take(400)
         )
     }
 }

@@ -1,156 +1,157 @@
 package com.example.audio
 
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.sqrt
+import java.util.Locale
 
 /**
- * Advanced hybrid acoustic speech-music analysis engine.
- * Computes Zero-Crossing Rate (ZCR), energy modulation cadence,
- * and vocal band concentration to identify commercial ad voice-overs
- * and differentiate them from harmonic music.
+ * Decides whether the metadata Spotify is currently exposing belongs to an ad break.
+ *
+ * This is intentionally a metadata classifier and not "acoustic AI". Reading a few PCM samples
+ * from a phone cannot reliably separate a voice-over from a sung vocal, and the previous
+ * implementation produced confident-looking scores that were effectively made up. Spotify
+ * clearly labels ads in its media session / notification ("Advertisement", "Ad break",
+ * sponsored artist, `spotify:ad:` URIs), and that is what we use.
+ *
+ * Signals are combined into a confidence score. A single weak signal can never trigger a
+ * recording, which keeps normal short tracks out of the library.
  */
 object AudioFingerprintEngine {
-
-    data class AcousticFeatures(
-        val zcr: Float,
-        val energyCadence: Float,
-        val speechScore: Float,
-        val isSpeechDominant: Boolean,
-        val peakToAverageRatio: Float
-    )
 
     data class FingerprintResult(
         val isAdBreak: Boolean,
         val confidence: Float,
-        val reason: String,
-        val acousticFeatures: AcousticFeatures
+        val reason: String
     )
 
-    /**
-     * Analyzes a 16-bit PCM audio frame buffer.
-     * @param pcmBuffer raw 16-bit signed PCM audio bytes
-     * @param sampleRate audio sample rate (e.g. 44100 or 48000)
-     */
-    fun analyzePcmFrame(pcmBuffer: ShortArray, sampleRate: Int = 44100): AcousticFeatures {
-        if (pcmBuffer.isEmpty()) {
-            return AcousticFeatures(0f, 0f, 0f, false, 0f)
-        }
+    enum class ContentType { ADVERTISEMENT, PODCAST, MUSIC, UNKNOWN }
 
-        val frameCount = pcmBuffer.size
-        var zeroCrossings = 0
-        var totalEnergy = 0.0
-        var peakSample = 0
+    private data class Signal(val label: String, val weight: Float, val strong: Boolean)
 
-        for (i in 0 until frameCount) {
-            val sample = pcmBuffer[i].toInt()
-            val absSample = abs(sample)
-            if (absSample > peakSample) {
-                peakSample = absSample
-            }
-            totalEnergy += (sample * sample).toDouble()
+    private val AD_TITLE_PATTERN = Regex(
+        "(^|\\b)(advertisement|advert|ad break|commercial break|sponsored|promoted)(\\b|$)",
+        RegexOption.IGNORE_CASE
+    )
 
-            if (i > 0) {
-                val prevSample = pcmBuffer[i - 1].toInt()
-                if ((sample >= 0 && prevSample < 0) || (sample < 0 && prevSample >= 0)) {
-                    zeroCrossings++
-                }
-            }
-        }
-
-        val zcr = zeroCrossings.toFloat() / max(1, frameCount - 1)
-        val rms = sqrt(totalEnergy / frameCount).toFloat()
-        val papr = if (rms > 0f) peakSample / rms else 0f
-
-        // Energy cadence modulation (speech fluctuates at 3-5 Hz syllabic rate)
-        // High ZCR with high compression (moderate PAPR) characterizes voice-over dialog
-        val zcrSpeechScore = when {
-            zcr in 0.08f..0.35f -> 0.85f // Typical speech phonemes & fricatives
-            zcr > 0.35f -> 0.70f        // High frequency sibilance/cymbals
-            else -> 0.20f               // Low ZCR, typical of harmonic bass/synths in music
-        }
-
-        // Commercial voice-overs are heavily mastered with radio compression (PAPR between 2.0 and 4.5)
-        val compressionScore = when {
-            papr in 1.8f..4.2f -> 0.80f
-            else -> 0.35f
-        }
-
-        val speechScore = (zcrSpeechScore * 0.6f + compressionScore * 0.4f).coerceIn(0f, 1f)
-        val isSpeechDominant = speechScore >= 0.65f
-
-        return AcousticFeatures(
-            zcr = zcr,
-            energyCadence = if (isSpeechDominant) 4.2f else 1.8f,
-            speechScore = speechScore,
-            isSpeechDominant = isSpeechDominant,
-            peakToAverageRatio = papr
-        )
+    fun isAdvertisementLabel(value: String?): Boolean {
+        val text = value?.trim().orEmpty()
+        if (text.isEmpty()) return false
+        if (text.equals("ad", ignoreCase = true)) return true
+        if (text.equals("ads", ignoreCase = true)) return true
+        return AD_TITLE_PATTERN.containsMatchIn(text)
     }
 
     /**
-     * Hybrid decision: Combines acoustic analysis with Spotify metadata broadcast signals.
+     * @param trackId Spotify's track URI when available (`spotify:ad:...` for ads).
+     * @param trackTitle Title shown in the media notification / session.
+     * @param artist Artist or "advertiser" field shown next to the title.
+     * @param lengthMillis Track duration when known. `0` means unknown.
      */
     fun evaluateAdBreak(
         trackId: String?,
         trackTitle: String?,
         artist: String?,
-        lengthMillis: Long,
-        acoustic: AcousticFeatures? = null
+        lengthMillis: Long
     ): FingerprintResult {
-        var confidence = 0f
-        val reasons = mutableListOf<String>()
+        val title = trackTitle?.trim().orEmpty()
+        val artistName = artist?.trim().orEmpty()
+        val id = trackId?.trim().orEmpty().lowercase(Locale.ROOT)
 
-        val normTitle = (trackTitle ?: "").lowercase()
-        val normArtist = (artist ?: "").lowercase()
-        val normId = (trackId ?: "").lowercase()
+        val signals = mutableListOf<Signal>()
 
-        // 1. Direct Spotify ad track ID or title marker
-        if (normId.startsWith("spotify:ad:") || normId.contains(":ad:") || normId == "spotify:ad") {
-            confidence += 0.90f
-            reasons.add("Spotify Ad Track URI detected ($trackId)")
+        if (id.startsWith("spotify:ad") || id.contains(":ad:")) {
+            signals += Signal("Ad track URI", 0.95f, strong = true)
+        }
+        if (isAdvertisementLabel(title)) {
+            signals += Signal("Ad title", 0.90f, strong = true)
+        }
+        if (isAdvertisementLabel(artistName)) {
+            signals += Signal("Advertiser label", 0.85f, strong = true)
+        }
+        if (artistName.equals("spotify", ignoreCase = true)) {
+            signals += Signal("Spotify-owned audio", 0.35f, strong = false)
+        }
+        if (title.contains("podcast", ignoreCase = true) && lengthMillis in 1..90_000L) {
+            // Short "podcast" entries are usually dynamically inserted host-read ads.
+            signals += Signal("Short podcast segment", 0.25f, strong = false)
+        }
+        if (lengthMillis in 5_000..75_000) {
+            signals += Signal("Ad-length clip", 0.20f, strong = false)
         }
 
-        if (normTitle.contains("advertis") || normTitle == "ad" || normTitle.contains("sponsored") || normTitle.contains("commercial")) {
-            confidence += 0.80f
-            reasons.add("Track title marked as Advertisement ($trackTitle)")
-        }
+        val strong = signals.filter { it.strong }
+        val weakScore = signals.filterNot { it.strong }.sumOf { it.weight.toDouble() }.toFloat()
+        val strongScore = strong.maxOfOrNull { it.weight } ?: 0f
 
-        if (normArtist.contains("advertis")) {
-            confidence += 0.75f
-            reasons.add("Artist labeled as Advertisement ($artist)")
-        } else if (normArtist == "spotify" || normArtist.contains("sponsor") || normArtist.contains("commercial")) {
-            confidence += 0.50f
-            reasons.add("Artist identified as Spotify / Sponsor")
-        }
+        val confidence = when {
+            strong.isNotEmpty() -> (strongScore + weakScore * 0.25f).coerceAtMost(1f)
+            weakScore >= 0.55f -> weakScore.coerceAtMost(0.75f)
+            else -> weakScore
+        }.coerceIn(0f, 1f)
 
-        // 2. Standard commercial duration profile (5s to 45s)
-        if (lengthMillis in 5_000..45_000) {
-            confidence += 0.30f
-            reasons.add("Commercial length match (${lengthMillis / 1000}s)")
-        }
+        // Requiring a strong label (or a very strong combination of weak ones) is what keeps
+        // 20-second songs by "Spotify" out of the library.
+        val isAd = strong.isNotEmpty() || weakScore >= 0.55f
 
-        // 3. Acoustic speech-over-music corroboration
-        val acousticScore = acoustic?.speechScore ?: 0.6f
-        if (acoustic?.isSpeechDominant == true) {
-            confidence += 0.35f
-            reasons.add("Voice-over acoustic speech profile detected (score: ${"%.2f".format(acousticScore)})")
-        }
-
-        val finalConfidence = confidence.coerceIn(0f, 1f)
-        val isAd = finalConfidence >= 0.65f
-
-        val summaryReason = if (isAd) {
-            reasons.joinToString(" • ")
+        val reason = if (signals.isEmpty()) {
+            "No ad signals in the current Spotify metadata"
         } else {
-            "Regular Music / Song (Confidence ${"%.0f".format(finalConfidence * 100)}%)"
+            signals.joinToString(" · ") { it.label }
         }
 
         return FingerprintResult(
             isAdBreak = isAd,
-            confidence = finalConfidence,
-            reason = summaryReason,
-            acousticFeatures = acoustic ?: AcousticFeatures(0.12f, 2.5f, 0.5f, false, 3.0f)
+            confidence = if (isAd) maxOf(confidence, 0.7f) else confidence,
+            reason = reason
         )
+    }
+
+    fun classify(
+        isAd: Boolean,
+        title: String,
+        album: String,
+        lengthMillis: Long
+    ): ContentType = when {
+        isAd -> ContentType.ADVERTISEMENT
+        lengthMillis > 600_000L -> ContentType.PODCAST
+        album.contains("podcast", ignoreCase = true) -> ContentType.PODCAST
+        title.isBlank() -> ContentType.UNKNOWN
+        else -> ContentType.MUSIC
+    }
+
+    /**
+     * Builds a human-readable label for the library. Spotify often exposes only
+     * "Advertisement" as the title, which is not useful once the clip is saved, so the
+     * advertiser name is folded into the title.
+     */
+    fun libraryTitle(title: String, advertiser: String): String {
+        val cleanTitle = title.trim()
+        val cleanAdvertiser = advertiser.trim()
+        val titleIsGeneric = cleanTitle.isEmpty() ||
+            isAdvertisementLabel(cleanTitle) ||
+            cleanTitle.equals("Spotify audio", ignoreCase = true) ||
+            cleanTitle.equals("Spotify", ignoreCase = true)
+        val advertiserIsGeneric = cleanAdvertiser.isEmpty() ||
+            cleanAdvertiser.equals("spotify", ignoreCase = true) ||
+            isAdvertisementLabel(cleanAdvertiser)
+
+        return when {
+            titleIsGeneric && !advertiserIsGeneric -> "Ad by $cleanAdvertiser"
+            titleIsGeneric -> "Spotify ad break"
+            else -> cleanTitle
+        }
+    }
+
+    fun advertiserName(title: String, artist: String): String {
+        val cleanArtist = artist.trim()
+        val isGeneric = cleanArtist.isEmpty() ||
+            cleanArtist.equals("spotify", ignoreCase = true) ||
+            isAdvertisementLabel(cleanArtist)
+        return if (isGeneric) {
+            // Try "Brought to you by <brand>" style titles before giving up.
+            val match = Regex("(?:by|from)\\s+([A-Z][\\w&.'-]*(?:\\s+[A-Z][\\w&.'-]*){0,3})")
+                .find(title)
+            match?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        } else {
+            cleanArtist
+        }
     }
 }

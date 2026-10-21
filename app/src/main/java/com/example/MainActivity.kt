@@ -1,6 +1,8 @@
 package com.example
 
 import android.Manifest
+import android.app.Activity
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,42 +10,33 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.GraphicEq
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,151 +44,53 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.service.AdRecordingService
+import com.example.audio.ExportManager
+import com.example.data.RecordedAdEntity
 import com.example.service.SpotifyNotificationListener
-import com.example.ui.components.AdCard
-import com.example.ui.components.AdDetailsDialog
-import com.example.ui.components.BuiltInPlayerBar
-import com.example.ui.components.FilterAndSortRow
-import com.example.ui.components.MonitoringBanner
-import com.example.ui.components.SettingsDialog
-import com.example.ui.components.SpotifyNowPlayingCard
-import com.example.ui.components.StudioTopBar
-import com.example.ui.theme.MyApplicationTheme
-import com.example.ui.theme.SpotifyGreen
-import com.example.ui.theme.TextPrimary
-import com.example.ui.theme.TextSecondary
+import com.example.ui.components.AdDetailsSheet
+import com.example.ui.components.AdListItem
+import com.example.ui.components.AppTopBar
+import com.example.ui.components.LibraryToolbar
+import com.example.ui.components.MonitoringCard
+import com.example.ui.components.NowPlayingCard
+import com.example.ui.components.OnboardingScreen
+import com.example.ui.components.PlayerBar
+import com.example.ui.components.SettingsSheet
+import com.example.ui.components.TagPill
+import com.example.ui.theme.SpotAdTheme
 import com.example.ui.viewmodel.MainViewModel
 
 class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
-    private var mediaProjectionManager: MediaProjectionManager? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
 
-        // Automatically start the background monitoring service if not in travel mode
-        val travel = AdRecordingService.isTravelMode(this)
-        AdRecordingService.setServiceState(
-            AdRecordingService.serviceUiState.value.copy(
-                isRunning = !travel,
-                isTravelModeActive = travel,
-                state = if (travel) com.example.service.MonitoringState.TRAVEL_INACTIVE else com.example.service.MonitoringState.SLEEPING
-            )
-        )
-        if (!travel) {
-            val serviceIntent = Intent(this, AdRecordingService::class.java).apply {
-                action = AdRecordingService.ACTION_START
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                try {
-                    startForegroundService(serviceIntent)
-                } catch (e: Exception) {
-                    try {
-                        startService(serviceIntent)
-                    } catch (_: Exception) {}
-                }
-            } else {
-                try {
-                    startService(serviceIntent)
-                } catch (_: Exception) {}
-            }
+        // Restore the monitor after a reboot or a process kill, but only if the user opted in.
+        if (com.example.data.SettingsStore.get(this).snapshot().monitoringEnabled) {
+            com.example.service.AdRecordingService.start(this)
         }
 
         setContent {
-            val serviceState by viewModel.serviceState.collectAsStateWithLifecycle()
-
-            // When Travel Mode is active, entire app UI transitions to the Orange theme
-            MyApplicationTheme(isTravelMode = serviceState.isTravelModeActive) {
+            val settings by viewModel.settings.collectAsStateWithLifecycle()
+            SpotAdTheme(themeMode = settings.themeMode) {
                 val context = LocalContext.current
-                var showSettingsDialog by remember { mutableStateOf(false) }
+                val settingsNow by viewModel.settings.collectAsStateWithLifecycle()
 
-                // Screen capture / internal audio launcher
-                val mediaProjectionLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.StartActivityForResult()
-                ) { result ->
-                    if (result.resultCode == RESULT_OK && result.data != null) {
-                        try {
-                            val projection = mediaProjectionManager?.getMediaProjection(result.resultCode, result.data!!)
-                            AdRecordingService.setMediaProjection(projection)
-                            Toast.makeText(context, "Internal audio capture active!", Toast.LENGTH_SHORT).show()
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "Could not start audio capture", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                }
-
-                // Permission launcher for audio and notifications
-                val permissionsLauncher = rememberLauncherForActivityResult(
-                    contract = ActivityResultContracts.RequestMultiplePermissions()
-                ) { _ ->
-                    // Notification permission handled
-                }
-
-                LaunchedEffect(Unit) {
-                    val neededPerms = mutableListOf<String>()
-                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                        neededPerms.add(Manifest.permission.RECORD_AUDIO)
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                            neededPerms.add(Manifest.permission.POST_NOTIFICATIONS)
-                        }
-                    }
-                    if (neededPerms.isNotEmpty()) {
-                        permissionsLauncher.launch(neededPerms.toTypedArray())
-                    }
-                }
-
-                SpotAdApp(
-                    viewModel = viewModel,
-                    onOpenSettings = { showSettingsDialog = true }
-                )
-
-                // Dialogs
-                val inspectingAd by viewModel.inspectingAd.collectAsStateWithLifecycle()
-                if (inspectingAd != null) {
-                    AdDetailsDialog(
-                        ad = inspectingAd!!,
-                        onDismiss = { viewModel.inspectAd(null) },
-                        onSaveMetadata = { id, title, adv, themes ->
-                            viewModel.updateAdMetadata(id, title, adv, themes)
-                        }
-                    )
-                }
-
-                val allAds by viewModel.recordedAds.collectAsStateWithLifecycle()
-                val oldAdsEligible by viewModel.oldAdsEligibleCount.collectAsStateWithLifecycle()
-
-                if (showSettingsDialog) {
-                    com.example.ui.components.SettingsBottomDrawer(
-                        isTravelModeActive = serviceState.isTravelModeActive,
-                        onToggleTravelMode = { viewModel.toggleTravelInactiveMode(context) },
-                        oldAdsCount = oldAdsEligible,
-                        totalAdsCount = allAds.size,
-                        onManualCleanup = { viewModel.performManualCleanup(context) },
-                        onDeleteNonStarredAds = { viewModel.deleteAllNonFavoriteAds(context) },
-                        onClearAllAds = { viewModel.clearAllRecordings(context) },
-                        onRequestMediaProjection = {
-                            val intent = mediaProjectionManager?.createScreenCaptureIntent()
-                            if (intent != null) {
-                                mediaProjectionLauncher.launch(intent)
-                            }
-                        },
-                        onDismiss = { showSettingsDialog = false }
-                    )
+                if (!settingsNow.onboardingComplete) {
+                    OnboardingScreen(onDone = { viewModel.completeOnboarding() })
+                } else {
+                    MainScreen(viewModel = viewModel, context = context)
                 }
             }
         }
@@ -203,159 +98,256 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun SpotAdApp(
+private fun MainScreen(
     viewModel: MainViewModel,
-    onOpenSettings: () -> Unit,
-    modifier: Modifier = Modifier
+    context: Context
 ) {
-    val context = LocalContext.current
-    val ads by viewModel.recordedAds.collectAsStateWithLifecycle()
+    val library by viewModel.library.collectAsStateWithLifecycle()
     val serviceState by viewModel.serviceState.collectAsStateWithLifecycle()
-    val spotifyNowPlaying by viewModel.spotifyNowPlaying.collectAsStateWithLifecycle()
-    val playerState by viewModel.playerState.collectAsStateWithLifecycle()
-    val sortOrder by viewModel.sortOrder.collectAsStateWithLifecycle()
-    val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
-    val uiNotification by viewModel.uiNotification.collectAsStateWithLifecycle()
-    val oldAdsCount by viewModel.oldAdsEligibleCount.collectAsStateWithLifecycle()
+    val nowPlaying by viewModel.nowPlaying.collectAsStateWithLifecycle()
+    val player by viewModel.playerState.collectAsStateWithLifecycle()
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val message by viewModel.message.collectAsStateWithLifecycle()
+    val inspectingAd by viewModel.inspectingAd.collectAsStateWithLifecycle()
+    val oldRecordings by viewModel.oldRecordings.collectAsStateWithLifecycle()
 
-    val currentPlayingAd = remember(playerState.adId, ads) {
-        ads.firstOrNull { it.id == playerState.adId }
+    val snackbarHostState = remember { SnackbarHostState() }
+    val projectionManager = remember(context) {
+        context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
     }
 
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-    var isNotifAccess by remember { mutableStateOf(SpotifyNotificationListener.isNotificationAccessGranted(context)) }
+    var notificationAccess by remember { mutableStateOf(SpotifyNotificationListener.hasAccess(context)) }
+    var micGranted by remember { mutableStateOf(hasMicPermission(context)) }
+    var showSettings by remember { mutableStateOf(false) }
+    var startAfterPermission by remember { mutableStateOf(false) }
+    var pendingExport by remember { mutableStateOf<RecordedAdEntity?>(null) }
 
-    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
-        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
-                val granted = SpotifyNotificationListener.isNotificationAccessGranted(context)
-                isNotifAccess = granted
-                if (granted) {
-                    SpotifyNotificationListener.rebindIfPossible(context)
-                    SpotifyNotificationListener.queryActiveSpotifyMediaSession(context)
+    val projectionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            viewModel.onProjectionResult(context, result.resultCode, result.data)
+        } else {
+            viewModel.onProjectionDenied()
+        }
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        micGranted = hasMicPermission(context)
+        if (micGranted && serviceState.monitoringEnabled) {
+            // Refresh the service so it can leave NEEDS_ACCESS without another tap.
+            com.example.service.AdRecordingService.start(context)
+        }
+        val notificationsGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            grants[Manifest.permission.POST_NOTIFICATIONS] == true ||
+                hasNotificationPermission(context)
+        } else {
+            true
+        }
+        if (startAfterPermission) {
+            startAfterPermission = false
+            if (micGranted) {
+                viewModel.toggleMonitoring(context)
+                if (!serviceState.captureGranted) launchProjection(projectionManager, projectionLauncher)
+            } else {
+                viewModel.postMessage("Microphone permission is required to capture audio", true)
+            }
+        }
+        if (!notificationsGranted) {
+            viewModel.postMessage("Notifications are hidden; Android may stop the recorder")
+        }
+    }
+
+    val storagePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val ad = pendingExport
+        pendingExport = null
+        if (granted && ad != null) {
+            viewModel.exportAd(context, ad)
+        } else {
+            viewModel.postMessage("Storage permission is needed to export on this Android version", true)
+        }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                notificationAccess = SpotifyNotificationListener.hasAccess(context)
+                micGranted = hasMicPermission(context)
+                SpotifyNotificationListener.requestRebind(context)
+                viewModel.onAppResumed(context)
+                // If an OEM killed the service while the app was in the background, bring it back.
+                if (viewModel.settings.value.monitoringEnabled) {
+                    com.example.service.AdRecordingService.start(context)
                 }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(message) {
+        message?.let {
+            snackbarHostState.showSnackbar(it.text)
+            viewModel.clearMessage()
         }
     }
 
-    LaunchedEffect(uiNotification) {
-        uiNotification?.let {
-            Toast.makeText(context, it.message, Toast.LENGTH_SHORT).show()
-            viewModel.clearNotification()
+    val requestCapture: () -> Unit = { launchProjection(projectionManager, projectionLauncher) }
+
+    val exportAd: (RecordedAdEntity) -> Unit = { ad ->
+        if (ExportManager.needsLegacyStoragePermission() &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingExport = ad
+            storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            viewModel.exportAd(context, ad)
         }
     }
 
     Scaffold(
-        modifier = modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+        modifier = Modifier.fillMaxSize(),
         containerColor = MaterialTheme.colorScheme.background,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             Column(modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars)) {
-                StudioTopBar(
-                    serviceState = serviceState,
-                    oldAdsCount = oldAdsCount,
-                    onOpenSettings = onOpenSettings
+                AppTopBar(
+                    title = "Library",
+                    subtitle = when {
+                        serviceState.monitoringEnabled -> "SpotAd is available in the background"
+                        else -> "Monitoring is off"
+                    },
+                    onOpenSettings = { showSettings = true }
                 )
             }
         },
         bottomBar = {
-            BuiltInPlayerBar(
-                playbackState = playerState,
-                currentAd = currentPlayingAd,
-                onPlayPause = {
-                    if (playerState.isPlaying) viewModel.pausePlayback() else viewModel.resumePlayback()
-                },
-                onSeek = { pos -> viewModel.seekPlayback(pos) },
-                onCycleSpeed = {
-                    val nextSpeed = when (playerState.speed) {
-                        1.0f -> 1.25f
-                        1.25f -> 1.5f
-                        1.5f -> 2.0f
-                        else -> 1.0f
-                    }
-                    viewModel.setPlaybackSpeed(nextSpeed)
-                },
-                onClose = { viewModel.pausePlayback() },
-                onShare = {
-                    currentPlayingAd?.let { viewModel.shareAd(context, it) }
+            val playingAd = library.ads.firstOrNull { it.id == player.adId }
+            if (player.adId != null && playingAd != null) {
+                Box(modifier = Modifier.navigationBarsPadding()) {
+                    PlayerBar(
+                        playback = player,
+                        ad = playingAd,
+                        onPlayPause = {
+                            if (player.isPlaying) viewModel.pausePlayback() else viewModel.resumePlayback()
+                        },
+                        onSeek = { viewModel.seekPlayback(it) },
+                        onCycleSpeed = {
+                            val next = when (player.speed) {
+                                1.0f -> 1.25f
+                                1.25f -> 1.5f
+                                1.5f -> 2.0f
+                                else -> 1.0f
+                            }
+                            viewModel.setPlaybackSpeed(next)
+                        },
+                        onShare = {
+                            library.ads.firstOrNull { it.id == player.adId }
+                                ?.let { viewModel.shareAd(context, it) }
+                        },
+                        onClose = { viewModel.closePlayer() }
+                    )
                 }
-            )
+            }
         }
     ) { innerPadding ->
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding),
-            contentPadding = PaddingValues(bottom = 90.dp),
+            contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Background Monitoring State Banner
-            item(key = "monitoring_banner") {
-                MonitoringBanner(
+            item(key = "monitoring") {
+                MonitoringCard(
                     serviceState = serviceState,
-                    onToggleMonitoring = { viewModel.toggleMonitoring(context) },
-                    onToggleTravelMode = { viewModel.toggleTravelInactiveMode(context) },
-                    onStopRecordingNow = { viewModel.stopRecordingNow(context) }
-                )
-            }
-
-            // Real-Time Spotify Now Playing Card: identifies songs, ads, podcasts with name, artist, total length, timestamp
-            item(key = "spotify_now_playing") {
-                SpotifyNowPlayingCard(
-                    nowPlaying = spotifyNowPlaying,
-                    serviceState = serviceState,
-                    isNotificationAccessGranted = isNotifAccess,
-                    onOpenNotificationSettings = {
-                        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    micGranted = micGranted,
+                    notificationAccess = notificationAccess,
+                    onToggleMonitoring = {
+                        if (serviceState.monitoringEnabled) {
+                            viewModel.toggleMonitoring(context)
+                        } else if (!micGranted) {
+                            startAfterPermission = true
+                            val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                permissions += Manifest.permission.POST_NOTIFICATIONS
+                            }
+                            permissionLauncher.launch(permissions.toTypedArray())
+                        } else {
+                            viewModel.toggleMonitoring(context)
+                            if (!serviceState.captureGranted) requestCapture()
                         }
-                        try {
-                            context.startActivity(intent)
-                        } catch (_: Exception) {}
-                    }
+                    },
+                    onRequestMic = {
+                        val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            permissions += Manifest.permission.POST_NOTIFICATIONS
+                        }
+                        startAfterPermission = false
+                        permissionLauncher.launch(permissions.toTypedArray())
+                    },
+                    onOpenNotificationSettings = { openNotificationAccess(context) },
+                    onRequestCapture = requestCapture,
+                    onStopRecording = { viewModel.stopCurrentRecording(context) },
+                    onRecordNow = { viewModel.startManualRecording(context) },
+                    modifier = Modifier.padding(horizontal = 16.dp)
                 )
             }
 
-            // Search & Sort Controls (Cleaned without badges below search field)
-            item(key = "filter_sort_row") {
-                FilterAndSortRow(
-                    searchQuery = searchQuery,
-                    onSearchQueryChange = { viewModel.setSearchQuery(it) },
-                    currentSort = sortOrder,
-                    onSortChange = { viewModel.setSortOrder(it) },
-                    totalCount = ads.size
+            item(key = "now_playing") {
+                NowPlayingCard(
+                    nowPlaying = nowPlaying,
+                    notificationAccess = notificationAccess,
+                    onOpenNotificationSettings = { openNotificationAccess(context) },
+                    modifier = Modifier.padding(horizontal = 16.dp)
                 )
             }
 
-            // Recorded Ad Cards List
-            if (ads.isEmpty()) {
-                item(key = "empty_state") {
-                    EmptyLibraryView(
-                        searchQuery = searchQuery,
-                        onResetFilter = {
+            item(key = "toolbar") {
+                LibraryToolbar(
+                    searchQuery = library.searchQuery,
+                    onSearchQueryChange = viewModel::setSearchQuery,
+                    filter = library.filter,
+                    onFilterChange = viewModel::setFilter,
+                    sort = library.sort,
+                    onSortChange = viewModel::setSortOrder,
+                    totalCount = library.totalCount,
+                    visibleCount = library.ads.size
+                )
+            }
+
+            if (library.ads.isEmpty()) {
+                item(key = "empty") {
+                    EmptyLibrary(
+                        isFiltered = library.searchQuery.isNotBlank() ||
+                            library.filter != com.example.ui.viewmodel.LibraryFilter.ALL,
+                        onClear = {
                             viewModel.setSearchQuery("")
-                        }
+                            viewModel.setFilter(com.example.ui.viewmodel.LibraryFilter.ALL)
+                        },
+                        modifier = Modifier.padding(horizontal = 16.dp)
                     )
                 }
             } else {
-                items(
-                    items = ads,
-                    key = { it.id }
-                ) { ad ->
-                    AdCard(
+                items(items = library.ads, key = { it.id }) { ad ->
+                    AdListItem(
                         ad = ad,
-                        playbackState = playerState,
+                        playback = player,
                         onPlayToggle = { viewModel.playAd(ad) },
-                        onSeek = { pos -> viewModel.seekPlayback(pos) },
-                        onFavoriteToggle = { viewModel.toggleFavorite(ad) },
-                        onExportMp3 = { viewModel.exportAdToMusic(context, ad) },
-                        onShare = { viewModel.shareAd(context, ad) },
+                        onSeek = { position ->
+                            if (player.adId != ad.id) viewModel.playAd(ad)
+                            viewModel.seekPlayback(position)
+                        },
+                        onToggleFavorite = { viewModel.toggleFavorite(ad) },
                         onInspect = { viewModel.inspectAd(ad) },
+                        onShare = { viewModel.shareAd(context, ad) },
+                        onExport = { exportAd(ad) },
                         onDelete = { viewModel.deleteAd(ad) },
                         modifier = Modifier.padding(horizontal = 16.dp)
                     )
@@ -363,79 +355,136 @@ fun SpotAdApp(
             }
         }
     }
+
+    if (showSettings) {
+        SettingsSheet(
+            settings = settings,
+            totalRecordings = library.totalCount,
+            storageBytes = library.storageBytes,
+            oldRecordings = oldRecordings,
+            notificationAccess = notificationAccess,
+            onOpenNotificationSettings = { openNotificationAccess(context) },
+            onMaxAdSecondsChange = viewModel::setMaxAdSeconds,
+            onRetentionChange = viewModel::setRetentionDays,
+            onThemeChange = viewModel::setThemeMode,
+            onCleanupOld = viewModel::cleanupOldRecordings,
+            onDeleteNonFavorites = viewModel::deleteUnstarredRecordings,
+            onDeleteAll = viewModel::deleteAllRecordings,
+            onReplayOnboarding = {
+                showSettings = false
+                viewModel.replayOnboarding()
+            },
+            onDismiss = { showSettings = false }
+        )
+    }
+
+    inspectingAd?.let { ad ->
+        AdDetailsSheet(
+            ad = ad,
+            onDismiss = { viewModel.inspectAd(null) },
+            onSave = { id, title, advertiser, themes, notes ->
+                viewModel.updateMetadata(id, title, advertiser, themes, notes)
+            },
+            onShare = { viewModel.shareAd(context, ad) },
+            onExport = { exportAd(ad) },
+            onDelete = { viewModel.deleteAd(ad) }
+        )
+    }
 }
 
 @Composable
-fun EmptyLibraryView(
-    searchQuery: String,
-    onResetFilter: () -> Unit,
+private fun EmptyLibrary(
+    isFiltered: Boolean,
+    onClear: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val isFiltered = searchQuery.isNotEmpty()
-
-    Surface(
-        shape = RoundedCornerShape(20.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 20.dp)
+            .padding(vertical = 40.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(64.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = Icons.Default.GraphicEq,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(32.dp)
-                )
+        Text(
+            text = if (isFiltered) "No matching recordings" else "No recordings yet",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+            textAlign = TextAlign.Center
+        )
+        Text(
+            text = if (isFiltered) {
+                "Try a different search or show all recordings."
+            } else {
+                "Play something in Spotify. When an ad break starts, SpotAd saves it here."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(top = 6.dp, start = 12.dp, end = 12.dp)
+        )
+        if (isFiltered) {
+            androidx.compose.material3.TextButton(onClick = onClear) {
+                Text("Clear filters")
             }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = if (isFiltered) "No Matching Ads Found" else "No Recorded Ads Yet",
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                color = TextPrimary
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
-                text = if (isFiltered) {
-                    "No ads matched your search query. Try clearing the search to view all recordings."
-                } else {
-                    "SpotAd is monitoring Spotify in the background. As you listen, any detected commercial ad breaks will be automatically recorded and saved here as MP3."
-                },
-                style = MaterialTheme.typography.bodyMedium.copy(fontSize = 13.sp, lineHeight = 18.sp),
-                color = TextSecondary,
-                textAlign = TextAlign.Center
-            )
-
-            if (isFiltered) {
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(
-                    onClick = onResetFilter,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.secondary,
-                        contentColor = TextPrimary
-                    ),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text("Clear Search")
-                }
+        } else {
+            Row(modifier = Modifier.padding(top = 12.dp)) {
+                TagPill("WAV audio")
+                Box(modifier = Modifier.padding(horizontal = 4.dp))
+                TagPill("On-device only")
             }
+        }
+    }
+}
+
+private fun hasMicPermission(context: Context): Boolean =
+    ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+        PackageManager.PERMISSION_GRANTED
+
+private fun hasNotificationPermission(context: Context): Boolean =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+    } else {
+        true
+    }
+
+private fun launchProjection(
+    manager: MediaProjectionManager?,
+    launcher: androidx.activity.result.ActivityResultLauncher<Intent>
+) {
+    val intent = try {
+        manager?.createScreenCaptureIntent()
+    } catch (_: Exception) {
+        null
+    }
+    if (intent != null) {
+        try {
+            launcher.launch(intent)
+        } catch (_: Exception) {
+        }
+    }
+}
+
+private fun openNotificationAccess(context: Context) {
+    val component = ComponentName(context, SpotifyNotificationListener::class.java)
+    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS).apply {
+            putExtra(
+                Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                component.flattenToString()
+            )
+        }
+    } else {
+        Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+    }
+    try {
+        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (_: Exception) {
+        try {
+            context.startActivity(
+                Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (_: Exception) {
         }
     }
 }

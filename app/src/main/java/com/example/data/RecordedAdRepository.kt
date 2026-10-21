@@ -3,110 +3,88 @@ package com.example.data
 import kotlinx.coroutines.flow.Flow
 import java.io.File
 
+/**
+ * Single source of truth for the recording library. Every delete path removes the audio file as
+ * well as the row, so the database can never point at missing audio.
+ */
 class RecordedAdRepository(private val dao: RecordedAdDao) {
-    val allAds: Flow<List<RecordedAdEntity>> = dao.getAllAds()
 
-    fun getAdsSorted(sortByDate: Boolean, ascending: Boolean): Flow<List<RecordedAdEntity>> {
-        return if (sortByDate) {
-            if (ascending) dao.getAdsSortedByDateAsc() else dao.getAdsSortedByDateDesc()
-        } else {
-            if (ascending) dao.getAdsSortedByDurationAsc() else dao.getAdsSortedByDurationDesc()
-        }
-    }
+    val ads: Flow<List<RecordedAdEntity>> = dao.observeAll()
 
-    suspend fun getAdById(id: Long): RecordedAdEntity? = dao.getAdById(id)
+    suspend fun getById(id: Long): RecordedAdEntity? = dao.getById(id)
 
     suspend fun insert(ad: RecordedAdEntity): Long = dao.insert(ad)
 
     suspend fun update(ad: RecordedAdEntity) = dao.update(ad)
 
+    suspend fun setFavorite(id: Long, isFavorite: Boolean) = dao.setFavorite(id, isFavorite)
+
+    suspend fun updateMetadata(
+        id: Long,
+        title: String,
+        advertiser: String,
+        themes: String,
+        notes: String
+    ) = dao.updateMetadata(id, title, advertiser, themes, notes)
+
     suspend fun delete(ad: RecordedAdEntity) {
+        deleteFile(ad.filePath)
         dao.delete(ad)
-        deleteFilesForAd(ad.filePath)
     }
 
     suspend fun deleteById(id: Long) {
-        val ad = dao.getAdById(id)
-        if (ad != null) {
-            deleteFilesForAd(ad.filePath)
+        val ad = dao.getById(id) ?: return
+        deleteFile(ad.filePath)
+        dao.delete(ad)
+    }
+
+    /** Returns how many rows were removed. */
+    suspend fun deleteOlderThan(days: Int): Int {
+        if (days <= 0) return 0
+        val cutoff = System.currentTimeMillis() - days * DAY_MILLIS
+        val expired = dao.olderThan(cutoff)
+        expired.forEach { deleteFile(it.filePath) }
+        return dao.deleteOlderThan(cutoff)
+    }
+
+    suspend fun countOlderThan(days: Int): Int {
+        if (days <= 0) return 0
+        return dao.countOlderThan(System.currentTimeMillis() - days * DAY_MILLIS)
+    }
+
+    suspend fun deleteNonFavorites(): Int {
+        dao.nonFavorites().forEach { deleteFile(it.filePath) }
+        return dao.deleteNonFavorites()
+    }
+
+    suspend fun deleteEverything(): Int {
+        dao.snapshot().forEach { deleteFile(it.filePath) }
+        return dao.deleteAll()
+    }
+
+    /** Frees orphaned audio files that no longer have a database row. */
+    suspend fun pruneOrphanFiles(adsDirectory: File): Int {
+        val known = dao.snapshot().map { it.filePath }.toSet()
+        val files = adsDirectory.listFiles() ?: return 0
+        var removed = 0
+        files.forEach { file ->
+            if (file.isFile && file.absolutePath !in known) {
+                if (file.delete()) removed++
+            }
         }
-        dao.deleteById(id)
+        return removed
     }
 
-    suspend fun toggleFavorite(id: Long, isFav: Boolean) = dao.updateFavorite(id, isFav)
-
-    suspend fun updateMetadata(id: Long, newTitle: String, newAdvertiser: String, newThemes: String) =
-        dao.updateMetadata(id, newTitle, newAdvertiser, newThemes)
-
-    /**
-     * Automated cleanup: deletes recordings older than 30 days unless marked as 'Favorite'.
-     * Returns the number of files deleted and total bytes freed.
-     */
-    suspend fun cleanupOldRecordings(days: Int = 30): Pair<Int, Long> {
-        val cutoffTimestamp = System.currentTimeMillis() - (days * 24L * 60L * 60L * 1000L)
-        val oldAds = dao.getOldNonFavoriteAds(cutoffTimestamp)
-        var freedBytes = 0L
-
-        for (ad in oldAds) {
-            freedBytes += deleteFilesForAd(ad.filePath)
-        }
-
-        val deletedCount = dao.deleteOldNonFavoriteAds(cutoffTimestamp)
-        return Pair(deletedCount, freedBytes)
-    }
-
-    suspend fun countOldRecordings(days: Int = 30): Int {
-        val cutoffTimestamp = System.currentTimeMillis() - (days * 24L * 60L * 60L * 1000L)
-        return dao.countOldNonFavoriteAds(cutoffTimestamp)
-    }
-
-    /**
-     * Completely purges all placeholder and sample demo files.
-     */
-    suspend fun purgeDemoData(): Pair<Int, Long> {
-        val sampleAds = dao.getSampleAds()
-        var freedBytes = 0L
-        for (ad in sampleAds) {
-            freedBytes += deleteFilesForAd(ad.filePath)
-        }
-        val deletedCount = dao.deleteSampleAds()
-        return Pair(deletedCount, freedBytes)
-    }
-
-    suspend fun deleteAllNonFavorites(): Pair<Int, Long> {
-        val ads = dao.getAllNonFavoriteAds()
-        var freedBytes = 0L
-        for (ad in ads) {
-            freedBytes += deleteFilesForAd(ad.filePath)
-        }
-        val count = dao.deleteAllNonFavoriteAds()
-        return Pair(count, freedBytes)
-    }
-
-    suspend fun deleteAll(): Pair<Int, Long> {
-        val ads = dao.getAllAdsSnapshot()
-        var freedBytes = 0L
-        for (ad in ads) {
-            freedBytes += deleteFilesForAd(ad.filePath)
-        }
-        val count = dao.deleteAllAds()
-        return Pair(count, freedBytes)
-    }
-
-    private fun deleteFilesForAd(filePath: String): Long {
-        var bytes = 0L
+    private fun deleteFile(path: String) {
         try {
-            val audioFile = File(filePath)
-            if (audioFile.exists()) {
-                bytes += audioFile.length()
-                audioFile.delete()
-            }
-            val metaFile = File(audioFile.parentFile, audioFile.nameWithoutExtension + "_metadata.json")
-            if (metaFile.exists()) {
-                bytes += metaFile.length()
-                metaFile.delete()
-            }
-        } catch (_: Exception) {}
-        return bytes
+            val file = File(path)
+            if (file.exists()) file.delete()
+        } catch (_: Exception) {
+            // A missing or already-deleted file must never block removing the row.
+        }
+    }
+
+    companion object {
+        const val DAY_MILLIS = 24L * 60L * 60L * 1000L
     }
 }

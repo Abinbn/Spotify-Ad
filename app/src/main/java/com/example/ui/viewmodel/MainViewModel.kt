@@ -3,20 +3,24 @@ package com.example.ui.viewmodel
 import android.app.Application
 import android.content.Context
 import android.content.Intent
-import android.os.Build
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.AudioPlayerManager
+import com.example.audio.AudioRecorderManager
 import com.example.audio.ExportManager
 import com.example.audio.PlaybackState
 import com.example.data.AppDatabase
+import com.example.data.AppSettings
 import com.example.data.RecordedAdEntity
 import com.example.data.RecordedAdRepository
+import com.example.data.SettingsStore
+import com.example.data.ThemeMode
 import com.example.service.AdRecordingService
-import com.example.service.AdSimulator
-import com.example.service.MonitoringState
+import com.example.service.NowPlaying
 import com.example.service.ServiceUiState
 import com.example.service.SpotifyNotificationListener
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -24,342 +28,333 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
-enum class SortOrder(val label: String) {
-    DATE_DESC("Newest First"),
-    DATE_ASC("Oldest First"),
-    DURATION_DESC("Longest Duration"),
-    DURATION_ASC("Shortest Duration")
+enum class SortOrder(val label: String, val shortLabel: String) {
+    NEWEST("Newest first", "Newest"),
+    OLDEST("Oldest first", "Oldest"),
+    LONGEST("Longest first", "Longest"),
+    SHORTEST("Shortest first", "Shortest")
 }
 
-data class UiNotification(
-    val message: String,
-    val isError: Boolean = false
+enum class LibraryFilter { ALL, FAVORITES }
+
+data class UiMessage(val text: String, val isError: Boolean = false)
+
+data class LibraryUiState(
+    val ads: List<RecordedAdEntity> = emptyList(),
+    val totalCount: Int = 0,
+    val favoriteCount: Int = 0,
+    val storageBytes: Long = 0L,
+    val searchQuery: String = "",
+    val filter: LibraryFilter = LibraryFilter.ALL,
+    val sort: SortOrder = SortOrder.NEWEST
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val repository: RecordedAdRepository
-    val playerManager: AudioPlayerManager = AudioPlayerManager(application)
+    private val repository: RecordedAdRepository =
+        RecordedAdRepository(AppDatabase.getInstance(application).recordedAdDao())
+    private val settingsStore = SettingsStore.get(application)
+    private val playerManager = AudioPlayerManager(application)
 
-    private val _sortOrder = MutableStateFlow(SortOrder.DATE_DESC)
-    val sortOrder: StateFlow<SortOrder> = _sortOrder.asStateFlow()
+    val settings: StateFlow<AppSettings> = settingsStore.settings
+    val serviceState: StateFlow<ServiceUiState> = AdRecordingService.state
+    val nowPlaying: StateFlow<NowPlaying> = AdRecordingService.nowPlaying
+    val playerState: StateFlow<PlaybackState> = playerManager.playbackState
 
     private val _searchQuery = MutableStateFlow("")
-    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
-
-    private val _selectedThemeFilter = MutableStateFlow("All")
-    val selectedThemeFilter: StateFlow<String> = _selectedThemeFilter.asStateFlow()
-
-    private val _uiNotification = MutableStateFlow<UiNotification?>(null)
-    val uiNotification: StateFlow<UiNotification?> = _uiNotification.asStateFlow()
+    private val _filter = MutableStateFlow(LibraryFilter.ALL)
+    private val _sort = MutableStateFlow(SortOrder.NEWEST)
+    private val _message = MutableStateFlow<UiMessage?>(null)
+    val message: StateFlow<UiMessage?> = _message.asStateFlow()
 
     private val _inspectingAd = MutableStateFlow<RecordedAdEntity?>(null)
     val inspectingAd: StateFlow<RecordedAdEntity?> = _inspectingAd.asStateFlow()
 
-    private val _oldAdsEligibleCount = MutableStateFlow(0)
-    val oldAdsEligibleCount: StateFlow<Int> = _oldAdsEligibleCount.asStateFlow()
+    private val _oldRecordings = MutableStateFlow(0)
+    val oldRecordings: StateFlow<Int> = _oldRecordings.asStateFlow()
 
-    val serviceState: StateFlow<ServiceUiState> = AdRecordingService.serviceUiState
-    val spotifyNowPlaying: StateFlow<com.example.service.SpotifyNowPlaying> = AdRecordingService.spotifyNowPlaying
-    val playerState: StateFlow<PlaybackState> = playerManager.playbackState
+    val library: StateFlow<LibraryUiState> = combine(
+        repositoryAds(),
+        _searchQuery,
+        _filter,
+        _sort
+    ) { ads, query, filter, sort ->
+        val trimmed = query.trim()
+        var visible = ads
+        if (filter == LibraryFilter.FAVORITES) {
+            visible = visible.filter { it.isFavorite }
+        }
+        if (trimmed.isNotEmpty()) {
+            visible = visible.filter { ad ->
+                ad.title.contains(trimmed, ignoreCase = true) ||
+                    ad.advertiser.contains(trimmed, ignoreCase = true) ||
+                    ad.notes.contains(trimmed, ignoreCase = true) ||
+                    ad.spokenKeywords.contains(trimmed, ignoreCase = true) ||
+                    ad.themeTags.contains(trimmed, ignoreCase = true)
+            }
+        }
+        visible = when (sort) {
+            SortOrder.NEWEST -> visible.sortedByDescending { it.timestamp }
+            SortOrder.OLDEST -> visible.sortedBy { it.timestamp }
+            SortOrder.LONGEST -> visible.sortedByDescending { it.durationMillis }
+            SortOrder.SHORTEST -> visible.sortedBy { it.durationMillis }
+        }
+        LibraryUiState(
+            ads = visible,
+            totalCount = ads.size,
+            favoriteCount = ads.count { it.isFavorite },
+            storageBytes = ads.sumOf { it.fileSizeBytes },
+            searchQuery = query,
+            filter = filter,
+            sort = sort
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
 
     init {
-        val dao = AppDatabase.getInstance(application).recordedAdDao()
-        repository = RecordedAdRepository(dao)
-
-        // Purge any placeholder or demo data per user request
         viewModelScope.launch {
-            AdSimulator.purgeDemoData(application)
-            // Automated 30-day cleanup on startup
-            val (deleted, freedBytes) = repository.cleanupOldRecordings(days = 30)
-            if (deleted > 0) {
-                _uiNotification.value = UiNotification("Cleaned up $deleted ads older than 30 days (${freedBytes / 1024} KB freed)")
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val days = settingsStore.snapshot().retentionDays
+                    if (days > 0) repository.deleteOlderThan(days)
+                    repository.pruneOrphanFiles(AudioRecorderManager.adsDirectory(application))
+                }
+                refreshOldCount()
+            }.onFailure { Log.w(TAG, "Startup maintenance failed", it) }
+        }
+
+        // Surface newly saved clips and player errors as in-app messages.
+        viewModelScope.launch {
+            var lastSavedAt = 0L
+            serviceState.collect { state ->
+                if (state.lastSavedAt > lastSavedAt && state.lastSavedTitle != null) {
+                    lastSavedAt = state.lastSavedAt
+                    _message.value = UiMessage("Saved \"${state.lastSavedTitle}\"")
+                    refreshOldCount()
+                }
             }
-            refreshOldAdsCount()
+        }
+        viewModelScope.launch {
+            var lastError: String? = null
+            playerState.collect { state ->
+                val error = state.error
+                if (error != null && error != lastError) {
+                    lastError = error
+                    _message.value = UiMessage(error, isError = true)
+                    playerManager.clearError()
+                }
+            }
         }
     }
 
-    // Reactive ad list with real-time filtering and sorting
-    val recordedAds: StateFlow<List<RecordedAdEntity>> = combine(
-        repository.allAds,
-        _sortOrder,
-        _searchQuery,
-        _selectedThemeFilter
-    ) { ads, sort, query, themeFilter ->
-        var list = ads
+    private fun repositoryAds() = repository.ads
 
-        // Filter by theme
-        if (themeFilter != "All") {
-            list = list.filter {
-                it.themeTags.contains(themeFilter, ignoreCase = true) ||
-                        it.spokenKeywords.contains(themeFilter, ignoreCase = true)
-            }
-        }
-
-        // Filter by search query
-        if (query.isNotBlank()) {
-            val q = query.trim().lowercase()
-            list = list.filter {
-                it.title.lowercase().contains(q) ||
-                        it.advertiser.lowercase().contains(q) ||
-                        it.spokenKeywords.lowercase().contains(q) ||
-                        it.themeTags.lowercase().contains(q)
-            }
-        }
-
-        // Sort
-        when (sort) {
-            SortOrder.DATE_DESC -> list.sortedByDescending { it.timestamp }
-            SortOrder.DATE_ASC -> list.sortedBy { it.timestamp }
-            SortOrder.DURATION_DESC -> list.sortedByDescending { it.durationMillis }
-            SortOrder.DURATION_ASC -> list.sortedBy { it.durationMillis }
-        }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    fun setSortOrder(order: SortOrder) {
-        _sortOrder.value = order
-    }
+    // ------------------------------------------------------------------ library controls
 
     fun setSearchQuery(query: String) {
         _searchQuery.value = query
     }
 
-    fun setThemeFilter(theme: String) {
-        _selectedThemeFilter.value = theme
+    fun setFilter(filter: LibraryFilter) {
+        _filter.value = filter
+    }
+
+    fun setSortOrder(order: SortOrder) {
+        _sort.value = order
     }
 
     fun inspectAd(ad: RecordedAdEntity?) {
         _inspectingAd.value = ad
     }
 
-    fun clearNotification() {
-        _uiNotification.value = null
-    }
-
-    /**
-     * Toggles Travel / Inactive mode to completely shut down the background monitor while travelling.
-     */
-    fun toggleTravelInactiveMode(context: Context) {
-        val currentTravel = serviceState.value.isTravelModeActive
-        val newTravelState = !currentTravel
-
-        AdRecordingService.setTravelModePreference(context, newTravelState)
-        val intent = Intent(context, AdRecordingService::class.java).apply {
-            action = AdRecordingService.ACTION_SET_TRAVEL_MODE
-            putExtra("travel_mode", newTravelState)
-        }
-        if (newTravelState) {
-            try {
-                context.startService(intent)
-            } catch (_: Exception) {}
-            _uiNotification.value = UiNotification("Travel Inactive Mode ON: Service completely disabled to save battery")
-        } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                try {
-                    context.startForegroundService(intent)
-                } catch (e: Exception) {
-                    try {
-                        context.startService(intent)
-                    } catch (_: Exception) {}
-                }
-            } else {
-                try {
-                    context.startService(intent)
-                } catch (_: Exception) {}
-            }
-            _uiNotification.value = UiNotification("Ad Monitor Resumed")
-            SpotifyNotificationListener.queryActiveSpotifyMediaSession(context)
-        }
-    }
-
-    /**
-     * Performs automated cleanup manually on demand: deletes recordings older than 30 days unless marked Favorite.
-     */
-    fun performManualCleanup(context: Context) {
+    fun toggleFavorite(ad: RecordedAdEntity) {
         viewModelScope.launch {
-            val (deleted, freedBytes) = repository.cleanupOldRecordings(days = 30)
-            refreshOldAdsCount()
-            if (deleted > 0) {
-                _uiNotification.value = UiNotification("Storage Cleaned: $deleted ads deleted (${freedBytes / 1024} KB freed)")
-            } else {
-                _uiNotification.value = UiNotification("Storage is clean: No non-favorite ads older than 30 days")
+            repository.setFavorite(ad.id, !ad.isFavorite)
+            if (_inspectingAd.value?.id == ad.id) {
+                _inspectingAd.value = ad.copy(isFavorite = !ad.isFavorite)
             }
         }
-    }
-
-    fun deleteAllNonFavoriteAds(context: Context) {
-        viewModelScope.launch {
-            val (deleted, freedBytes) = repository.deleteAllNonFavorites()
-            refreshOldAdsCount()
-            _uiNotification.value = UiNotification("Deleted $deleted non-starred ads (${freedBytes / 1024} KB freed)")
-        }
-    }
-
-    fun clearAllRecordings(context: Context) {
-        viewModelScope.launch {
-            playerManager.stop()
-            val (deleted, freedBytes) = repository.deleteAll()
-            refreshOldAdsCount()
-            _uiNotification.value = UiNotification("Cleared all recordings ($deleted deleted, ${freedBytes / 1024} KB freed)")
-        }
-    }
-
-    private suspend fun refreshOldAdsCount() {
-        _oldAdsEligibleCount.value = repository.countOldRecordings(days = 30)
-    }
-
-    fun toggleMonitoring(context: Context) {
-        val currentState = serviceState.value.state
-        val isCurrentlyActive = serviceState.value.isRunning && currentState != MonitoringState.IDLE
-
-        if (isCurrentlyActive) {
-            val intent = Intent(context, AdRecordingService::class.java).apply {
-                action = AdRecordingService.ACTION_STOP
-            }
-            try {
-                context.startService(intent)
-            } catch (e: Exception) {
-                android.util.Log.e("MainViewModel", "Failed to stop service", e)
-            }
-            AdRecordingService.setServiceState(
-                serviceState.value.copy(
-                    isRunning = false,
-                    state = MonitoringState.IDLE
-                )
-            )
-            _uiNotification.value = UiNotification("Ad Monitor Paused")
-        } else {
-            // Turning ON monitoring
-            AdRecordingService.setTravelModePreference(context, false)
-            AdRecordingService.setServiceState(
-                serviceState.value.copy(
-                    isRunning = true,
-                    isTravelModeActive = false,
-                    state = MonitoringState.SLEEPING
-                )
-            )
-            val intent = Intent(context, AdRecordingService::class.java).apply {
-                action = AdRecordingService.ACTION_START
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                try {
-                    context.startForegroundService(intent)
-                } catch (e: Exception) {
-                    try {
-                        context.startService(intent)
-                    } catch (e2: Exception) {
-                        android.util.Log.e("MainViewModel", "Failed to start service", e2)
-                    }
-                }
-            } else {
-                try {
-                    context.startService(intent)
-                } catch (e: Exception) {
-                    android.util.Log.e("MainViewModel", "Failed to start service", e)
-                }
-            }
-            _uiNotification.value = UiNotification("Ad Monitor Active (Listening for Spotify)")
-            // Query current active Spotify media sessions immediately
-            SpotifyNotificationListener.queryActiveSpotifyMediaSession(context)
-            SpotifyNotificationListener.rebindIfPossible(context)
-        }
-    }
-
-    fun playAd(ad: RecordedAdEntity) {
-        playerManager.play(ad.id, ad.filePath)
-    }
-
-    fun pausePlayback() {
-        playerManager.pause()
-    }
-
-    fun resumePlayback() {
-        playerManager.resume()
-    }
-
-    fun seekPlayback(positionMs: Long) {
-        playerManager.seekTo(positionMs)
-    }
-
-    fun setPlaybackSpeed(speed: Float) {
-        playerManager.setSpeed(speed)
     }
 
     fun deleteAd(ad: RecordedAdEntity) {
         viewModelScope.launch {
-            if (playerState.value.adId == ad.id) {
-                playerManager.stop()
-            }
+            if (playerState.value.adId == ad.id) playerManager.stop()
             repository.delete(ad)
-            _uiNotification.value = UiNotification("Deleted: \"${ad.title}\"")
-            refreshOldAdsCount()
+            if (_inspectingAd.value?.id == ad.id) _inspectingAd.value = null
+            _message.value = UiMessage("Deleted \"${ad.displayTitle}\"")
+            refreshOldCount()
         }
     }
 
-    fun toggleFavorite(ad: RecordedAdEntity) {
+    fun updateMetadata(id: Long, title: String, advertiser: String, themes: String, notes: String) {
         viewModelScope.launch {
-            repository.toggleFavorite(ad.id, !ad.isFavorite)
-            refreshOldAdsCount()
-        }
-    }
-
-    fun updateAdMetadata(id: Long, newTitle: String, newAdvertiser: String, newThemes: String) {
-        viewModelScope.launch {
-            repository.updateMetadata(id, newTitle, newAdvertiser, newThemes)
+            repository.updateMetadata(id, title, advertiser, themes, notes)
             _inspectingAd.value = null
-            _uiNotification.value = UiNotification("Metadata updated")
+            _message.value = UiMessage("Details updated")
         }
     }
 
-    fun exportAdToMusic(context: Context, ad: RecordedAdEntity) {
+    fun exportAd(context: Context, ad: RecordedAdEntity) {
         viewModelScope.launch {
-            val result = ExportManager.exportToPublicMusic(context, ad)
-            result.onSuccess {
-                _uiNotification.value = UiNotification("Exported MP3 to Music/SpotifyAds folder!")
-            }.onFailure { err ->
-                _uiNotification.value = UiNotification("Export failed: ${err.message}", isError = true)
-            }
+            val result = withContext(Dispatchers.IO) { ExportManager.exportToMusic(context, ad) }
+            _message.value = result.fold(
+                onSuccess = { UiMessage("Exported to Music/SpotAd") },
+                onFailure = { UiMessage(it.message ?: "Export failed", isError = true) }
+            )
         }
     }
 
     fun shareAd(context: Context, ad: RecordedAdEntity) {
-        ExportManager.shareAd(context, ad)
-    }
-
-    fun triggerSimulation(context: Context, presetIndex: Int) {
-        val isRunning = serviceState.value.isRunning
-        if (!isRunning) {
-            val intent = Intent(context, AdRecordingService::class.java).apply {
-                action = AdRecordingService.ACTION_START
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                try {
-                    context.startForegroundService(intent)
-                } catch (e: Exception) {
-                    context.startService(intent)
-                }
-            } else {
-                context.startService(intent)
-            }
-        }
-
-        _uiNotification.value = UiNotification("Capturing live test ad break...")
-        AdSimulator.simulateLiveAdBreak(context, presetIndex, simulatedDurationSec = 6) {
-            _uiNotification.value = UiNotification("Test ad recorded and tagged successfully!")
+        ExportManager.share(context, ad).onFailure {
+            _message.value = UiMessage(it.message ?: "Sharing failed", isError = true)
         }
     }
 
-    fun stopRecordingNow(context: Context) {
-        val intent = Intent(context, AdRecordingService::class.java).apply {
-            action = AdRecordingService.ACTION_END_AD
+    fun clearMessage() {
+        _message.value = null
+    }
+
+    fun postMessage(text: String, isError: Boolean = false) {
+        _message.value = UiMessage(text, isError)
+    }
+
+    // ------------------------------------------------------------------ monitoring
+
+    fun toggleMonitoring(context: Context) {
+        if (serviceState.value.monitoringEnabled) {
+            AdRecordingService.stop(context)
+            _message.value = UiMessage("Monitoring paused")
+        } else {
+            AdRecordingService.start(context)
         }
-        context.startService(intent)
+    }
+
+    fun stopCurrentRecording(context: Context) {
+        AdRecordingService.stopRecording(context)
+    }
+
+    fun startManualRecording(context: Context) {
+        AdRecordingService.recordNow(context)
+    }
+
+    fun onProjectionResult(context: Context, resultCode: Int, data: Intent?) {
+        if (data == null) {
+            _message.value = UiMessage("Audio capture was not granted", isError = true)
+            return
+        }
+        AdRecordingService.grantProjection(context, resultCode, data)
+        if (!settingsStore.snapshot().monitoringEnabled) {
+            AdRecordingService.start(context)
+        }
+    }
+
+    fun onProjectionDenied() {
+        _message.value = UiMessage(
+            "Audio capture is needed to save ads. You can grant it any time.",
+            isError = true
+        )
+    }
+
+    fun dismissServiceError() {
+        AdRecordingService.clearError()
+    }
+
+    fun onAppResumed(context: Context) {
+        SpotifyNotificationListener.refreshNowPlaying(context)
+        viewModelScope.launch { refreshOldCount() }
+    }
+
+    // ------------------------------------------------------------------ settings
+
+    fun setMaxAdSeconds(seconds: Int) {
+        settingsStore.update { it.copy(maxAdSeconds = seconds.coerceIn(15, 600)) }
+    }
+
+    fun setRetentionDays(days: Int) {
+        settingsStore.update { it.copy(retentionDays = days.coerceIn(0, 3650)) }
+        viewModelScope.launch {
+            if (days > 0) {
+                val removed = withContext(Dispatchers.IO) { repository.deleteOlderThan(days) }
+                if (removed > 0) _message.value = UiMessage("Removed $removed old recordings")
+            }
+            refreshOldCount()
+        }
+    }
+
+    fun setThemeMode(mode: ThemeMode) {
+        settingsStore.update { it.copy(themeMode = mode) }
+    }
+
+    fun completeOnboarding() {
+        settingsStore.update { it.copy(onboardingComplete = true) }
+    }
+
+    fun replayOnboarding() {
+        settingsStore.update { it.copy(onboardingComplete = false) }
+    }
+
+    fun cleanupOldRecordings() {
+        viewModelScope.launch {
+            val removed = withContext(Dispatchers.IO) {
+                repository.deleteOlderThan(settingsStore.snapshot().retentionDays)
+            }
+            refreshOldCount()
+            _message.value = UiMessage(if (removed > 0) "Removed $removed recordings" else "Nothing to clean up")
+        }
+    }
+
+    fun deleteAllRecordings() {
+        viewModelScope.launch {
+            playerManager.stop()
+            val removed = withContext(Dispatchers.IO) { repository.deleteEverything() }
+            refreshOldCount()
+            _message.value = UiMessage("Deleted $removed recordings")
+        }
+    }
+
+    fun deleteUnstarredRecordings() {
+        viewModelScope.launch {
+            val removed = withContext(Dispatchers.IO) { repository.deleteNonFavorites() }
+            refreshOldCount()
+            _message.value = UiMessage("Deleted $removed recordings")
+        }
+    }
+
+    // ------------------------------------------------------------------ playback
+
+    fun playAd(ad: RecordedAdEntity) {
+        if (!File(ad.filePath).exists()) {
+            _message.value = UiMessage("The audio file for this recording is missing", isError = true)
+            return
+        }
+        playerManager.play(ad.id, ad.filePath)
+    }
+
+    fun pausePlayback() = playerManager.pause()
+
+    fun resumePlayback() = playerManager.resume()
+
+    fun seekPlayback(positionMs: Long) = playerManager.seekTo(positionMs)
+
+    fun setPlaybackSpeed(speed: Float) = playerManager.setSpeed(speed)
+
+    fun closePlayer() = playerManager.stop()
+
+    private suspend fun refreshOldCount() {
+        val days = settingsStore.snapshot().retentionDays
+        _oldRecordings.value = withContext(Dispatchers.IO) {
+            if (days > 0) repository.countOlderThan(days) else 0
+        }
     }
 
     override fun onCleared() {
         super.onCleared()
         playerManager.release()
+    }
+
+    companion object {
+        private const val TAG = "MainViewModel"
     }
 }

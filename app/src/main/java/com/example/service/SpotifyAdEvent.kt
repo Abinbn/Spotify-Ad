@@ -1,30 +1,31 @@
 package com.example.service
 
-data class SpotifyNowPlaying(
-    val isSpotifyDetected: Boolean = false,
+enum class ContentKind { NONE, AD, MUSIC, PODCAST, UNKNOWN }
+
+/** What Spotify is playing right now, according to the media session / notification. */
+data class NowPlaying(
+    val detected: Boolean = false,
     val isPlaying: Boolean = false,
+    val isAd: Boolean = false,
     val title: String = "",
     val artist: String = "",
-    val album: String = "",
-    val totalLengthMillis: Long = 0L,
-    val currentPositionMillis: Long = 0L,
-    val lastDetectedTimestamp: Long = 0L,
-    val isAdBreak: Boolean = false,
-    val contentType: String = "Idle",
-    val source: String = ""
+    val kind: ContentKind = ContentKind.NONE,
+    val source: String = "",
+    val updatedAt: Long = 0L
 )
 
+/** A single metadata update emitted by the notification listener or a media session. */
 data class SpotifyAdEvent(
     val trackId: String?,
-    val trackTitle: String,
+    val title: String,
     val artist: String,
     val album: String,
-    val lengthMillis: Long,
-    val currentPositionMillis: Long = 0L,
+    val durationMillis: Long,
+    val positionMillis: Long = 0L,
     val isPlaying: Boolean,
-    val isAdBreak: Boolean,
+    val isAd: Boolean,
     val confidence: Float,
     val source: String,
-    val contentType: String = "Music Track",
-    val timestamp: Long = System.currentTimeMillis()
+    val kind: ContentKind = ContentKind.UNKNOWN,
+    val receivedAt: Long = System.currentTimeMillis()
 )

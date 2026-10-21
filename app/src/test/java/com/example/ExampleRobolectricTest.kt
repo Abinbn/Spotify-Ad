@@ -4,16 +4,18 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.AudioFingerprintEngine
+import com.example.audio.AudioRecorderManager
 import com.example.audio.SpeechKeywordExtractor
 import com.example.data.AppDatabase
 import com.example.data.RecordedAdEntity
 import com.example.data.RecordedAdRepository
-import com.example.service.AdRecordingService
+import com.example.data.SettingsStore
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -44,149 +46,197 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun readStringFromContext() {
+    fun appNameIsSet() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val appName = context.getString(R.string.app_name)
-        assertEquals("SpotAd Recorder", appName)
+        assertEquals("SpotAd", context.getString(R.string.app_name))
     }
 
     @Test
-    fun testAudioFingerprintEngineAdDetection() {
-        val adResult = AudioFingerprintEngine.evaluateAdBreak(
+    fun adTrackUriIsDetected() {
+        val result = AudioFingerprintEngine.evaluateAdBreak(
             trackId = "spotify:ad:12345",
             trackTitle = "Advertisement",
             artist = "Spotify",
             lengthMillis = 30_000L
         )
-        assertTrue(adResult.isAdBreak)
-        assertTrue(adResult.confidence >= 0.7f)
+        assertTrue(result.isAdBreak)
+        assertTrue(result.confidence >= 0.9f)
+    }
 
-        val musicResult = AudioFingerprintEngine.evaluateAdBreak(
+    @Test
+    fun normalTrackIsNotAnAd() {
+        val result = AudioFingerprintEngine.evaluateAdBreak(
             trackId = "spotify:track:98765",
             trackTitle = "Bohemian Rhapsody",
             artist = "Queen",
             lengthMillis = 354_000L
         )
-        assertFalse(musicResult.isAdBreak)
+        assertFalse(result.isAdBreak)
     }
 
     @Test
-    fun testSpeechKeywordExtractor() {
-        val extracted = SpeechKeywordExtractor.extract(
-            title = "Special Spotify Promotion",
-            advertiser = "Spotify",
-            durationMillis = 30_000L,
-            speechRecognizedText = "Get three months of Spotify Premium for free. Enjoy unlimited music."
+    fun shortSongIsNotAnAd() {
+        // A 30-second interlude must not be flagged just because it is short.
+        val result = AudioFingerprintEngine.evaluateAdBreak(
+            trackId = null,
+            trackTitle = "Interlude",
+            artist = "Some Artist",
+            lengthMillis = 30_000L
         )
-        assertTrue(extracted.keywords.any { it.contains("free", ignoreCase = true) || it.contains("premium", ignoreCase = true) })
-        assertTrue(extracted.themes.contains("Subscription") || extracted.themes.contains("Special Offer"))
-        assertNotNull(extracted.transcriptSnippet)
+        assertFalse(result.isAdBreak)
     }
 
     @Test
-    fun testRoomDatabaseAdPersistence() = runBlocking {
+    fun genericAdTitleUsesAdvertiser() {
+        assertEquals(
+            "Ad by Acme",
+            AudioFingerprintEngine.libraryTitle("Advertisement", "Acme")
+        )
+        assertEquals(
+            "Ad by Acme",
+            AudioFingerprintEngine.libraryTitle("", "Acme")
+        )
+        assertEquals(
+            "Acme summer sale",
+            AudioFingerprintEngine.libraryTitle("Acme summer sale", "Acme")
+        )
+    }
+
+    @Test
+    fun keywordExtractorOnlyUsesProvidedText() {
+        val withoutSpeech = SpeechKeywordExtractor.extract(
+            title = "Advertisement",
+            advertiser = "Acme",
+            durationMillis = 20_000L
+        )
+        assertEquals("", withoutSpeech.transcriptSnippet)
+
+        val withSpeech = SpeechKeywordExtractor.extract(
+            title = "Advertisement",
+            advertiser = "Acme",
+            durationMillis = 20_000L,
+            speechRecognizedText = "Get three months of Spotify Premium for free."
+        )
+        assertTrue(withSpeech.keywords.any { it.contains("premium", ignoreCase = true) })
+        assertTrue(withSpeech.themes.contains("Subscription") || withSpeech.themes.contains("Special offer"))
+        assertTrue(withSpeech.transcriptSnippet.contains("three months"))
+    }
+
+    @Test
+    fun wavHeaderIsValid() {
+        val dataLength = 44_100L
+        val header = AudioRecorderManager.wavHeader(dataLength, 44_100)
+        assertEquals(44, header.size)
+        assertEquals("RIFF", header.copyOfRange(0, 4).toString(Charsets.US_ASCII))
+        assertEquals("WAVE", header.copyOfRange(8, 12).toString(Charsets.US_ASCII))
+        assertEquals("fmt ", header.copyOfRange(12, 16).toString(Charsets.US_ASCII))
+        assertEquals("data", header.copyOfRange(36, 40).toString(Charsets.US_ASCII))
+
+        val riffSize = (header[4].toInt() and 0xFF) or
+            ((header[5].toInt() and 0xFF) shl 8) or
+            ((header[6].toInt() and 0xFF) shl 16) or
+            ((header[7].toInt() and 0xFF) shl 24)
+        assertEquals((36 + dataLength).toInt(), riffSize)
+
+        val sampleRate = (header[24].toInt() and 0xFF) or
+            ((header[25].toInt() and 0xFF) shl 8) or
+            ((header[26].toInt() and 0xFF) shl 16) or
+            ((header[27].toInt() and 0xFF) shl 24)
+        assertEquals(44_100, sampleRate)
+    }
+
+    @Test
+    fun waveformResamplingReturnsRequestedNumberOfBars() {
+        val recorder = AudioRecorderManager(ApplicationProvider.getApplicationContext())
+        val bars = recorder.resampleWaveform(List(500) { 0.5f }, bars = 32)
+        assertEquals(32, bars.size)
+        assertTrue(bars.all { it in 0f..1f })
+        assertTrue(recorder.resampleWaveform(emptyList(), 32).isEmpty())
+    }
+
+    @Test
+    fun roomDatabaseRoundTrip() = runBlocking {
         val dao = db.recordedAdDao()
         val entity = RecordedAdEntity(
             title = "Test Ad",
             advertiser = "Test Advertiser",
-            filePath = "/data/user/0/com.example/files/recorded_ads/test.mp3",
+            filePath = "/data/user/0/com.example/files/ads/test.wav",
             durationMillis = 15_000L,
-            timestamp = System.currentTimeMillis(),
             fileSizeBytes = 25000L,
             spokenKeywords = "save, promo",
-            themeTags = "Special Offer",
-            isFavorite = false
+            themeTags = "Special offer",
+            sampleRate = 44_100,
+            source = "Test"
         )
 
         val id = dao.insert(entity)
         assertTrue(id > 0)
 
-        val retrieved = dao.getAdById(id)
+        val retrieved = dao.getById(id)
         assertNotNull(retrieved)
         assertEquals("Test Ad", retrieved?.title)
-        assertEquals("Test Advertiser", retrieved?.advertiser)
+        assertEquals(44_100, retrieved?.sampleRate)
+        assertEquals(listOf("save", "promo"), retrieved?.keywords)
 
-        dao.updateFavorite(id, true)
-        val updated = dao.getAdById(id)
-        assertTrue(updated?.isFavorite == true)
+        dao.setFavorite(id, true)
+        assertTrue(dao.getById(id)?.isFavorite == true)
 
-        val allAds = dao.getAllAds().first()
-        assertEquals(1, allAds.size)
+        assertEquals(1, dao.observeAll().first().size)
 
-        dao.deleteById(id)
-        val emptyList = dao.getAllAds().first()
-        assertTrue(emptyList.isEmpty())
+        dao.delete(retrieved!!)
+        assertTrue(dao.observeAll().first().isEmpty())
     }
 
     @Test
-    fun testAutomated30DayCleanupExemptsFavorites() = runBlocking {
+    fun cleanupDeletesOldUnstarredButKeepsStarredAndRecent() = runBlocking {
         val dao = db.recordedAdDao()
         val now = System.currentTimeMillis()
         val thirtyFiveDaysAgo = now - (35L * 24 * 60 * 60 * 1000)
         val fiveDaysAgo = now - (5L * 24 * 60 * 60 * 1000)
 
-        // 1. Old Ad (35 days old, non-favorite) -> SHOULD be deleted
         dao.insert(
             RecordedAdEntity(
-                id = 101L,
-                title = "Old Promo",
-                advertiser = "Brand A",
-                filePath = "/tmp/old_ad.mp3",
-                durationMillis = 15000L,
-                timestamp = thirtyFiveDaysAgo,
-                isFavorite = false
+                title = "Old Promo", advertiser = "Brand A", filePath = "/tmp/old.wav",
+                durationMillis = 15_000L, timestamp = thirtyFiveDaysAgo, isFavorite = false
+            )
+        )
+        dao.insert(
+            RecordedAdEntity(
+                title = "Favorite Jingle", advertiser = "Brand B", filePath = "/tmp/fav.wav",
+                durationMillis = 20_000L, timestamp = thirtyFiveDaysAgo, isFavorite = true
+            )
+        )
+        dao.insert(
+            RecordedAdEntity(
+                title = "Recent Ad", advertiser = "Brand C", filePath = "/tmp/recent.wav",
+                durationMillis = 30_000L, timestamp = fiveDaysAgo, isFavorite = false
             )
         )
 
-        // 2. Old Ad (35 days old, FAVORITE) -> MUST be preserved
-        dao.insert(
-            RecordedAdEntity(
-                id = 102L,
-                title = "Favorite Jingle",
-                advertiser = "Brand B",
-                filePath = "/tmp/fav_ad.mp3",
-                durationMillis = 20000L,
-                timestamp = thirtyFiveDaysAgo,
-                isFavorite = true
-            )
-        )
+        assertEquals(3, dao.observeAll().first().size)
+        assertEquals(1, repository.countOlderThan(30))
 
-        // 3. Recent Ad (5 days old, non-favorite) -> MUST be preserved
-        dao.insert(
-            RecordedAdEntity(
-                id = 103L,
-                title = "Recent Ad",
-                advertiser = "Brand C",
-                filePath = "/tmp/recent_ad.mp3",
-                durationMillis = 30000L,
-                timestamp = fiveDaysAgo,
-                isFavorite = false
-            )
-        )
+        val deleted = repository.deleteOlderThan(30)
+        assertEquals(1, deleted)
 
-        assertEquals(3, dao.getAllAds().first().size)
-        assertEquals(1, repository.countOldRecordings(30))
-
-        // Run automated cleanup
-        val (deletedCount, _) = repository.cleanupOldRecordings(days = 30)
-        assertEquals(1, deletedCount)
-
-        val remaining = dao.getAllAds().first()
+        val remaining = dao.observeAll().first()
         assertEquals(2, remaining.size)
-
-        // Confirm Favorite (102) and Recent (103) survived, Old non-fav (101) deleted
-        assertTrue(remaining.any { it.id == 102L && it.isFavorite })
-        assertTrue(remaining.any { it.id == 103L })
-        assertFalse(remaining.any { it.id == 101L })
+        assertTrue(remaining.any { it.title == "Favorite Jingle" && it.isFavorite })
+        assertTrue(remaining.any { it.title == "Recent Ad" })
     }
 
     @Test
-    fun testTravelModePreferenceToggle() {
+    fun settingsPersistAcrossStoreInstances() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        AdRecordingService.setTravelModePreference(context, true)
-        assertTrue(AdRecordingService.isTravelMode(context))
+        val store = SettingsStore.get(context)
+        val original = store.snapshot()
 
-        AdRecordingService.setTravelModePreference(context, false)
-        assertFalse(AdRecordingService.isTravelMode(context))
+        store.update { it.copy(maxAdSeconds = 90, retentionDays = 7) }
+        assertEquals(90, store.snapshot().maxAdSeconds)
+        assertEquals(7, store.snapshot().retentionDays)
+        assertNotEquals(original.maxAdSeconds, store.snapshot().maxAdSeconds)
+
+        // Restore defaults so other tests in the same process are not affected.
+        store.update { it.copy(maxAdSeconds = 120, retentionDays = 30) }
     }
 }
