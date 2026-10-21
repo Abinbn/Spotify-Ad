@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "SpotAd Recorder"
+rootProject.name = "SpotAd"
 
 include(":app")
