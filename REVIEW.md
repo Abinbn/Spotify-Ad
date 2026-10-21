@@ -130,10 +130,14 @@ Everything is local. No analytics, no cloud, no invented metadata.
 - The app shipped Firebase AI, App Check, Retrofit, OkHttp and Moshi — none were used, but they
   added size, network permissions and privacy-review questions. Removed, along with the
   `google-services` and `secrets` plugins and the unused `.env.example`.
-- `applicationId` **and** source namespace changed from `com.aistudio.spotad.rxnpld` /
-  `com.example` to `com.spotad.recorder`; version is `1.0.0` (`versionCode 6`). **This requires a
-  new Play listing** (the old package cannot be migrated). The whole source tree moved to
-  `app/src/main/java/com/spotad/recorder/`, so no `com.example` namespace remains in the APK.
+- Source namespace and the whole tree moved from `com.example` to `com.spotad.recorder`
+  (`app/src/main/java/com/spotad/recorder/`), so no `com.example` namespace remains in the APK;
+  version is `1.0.0` (`versionCode 6`).
+- `applicationId` is currently set to **`com.aistudio.spotad.rxnpld` for testing**, so a test build
+  installs over an existing install of the original app and keeps its data. For a store release it
+  must go back to `com.spotad.recorder`; the package cannot be changed after a listing is published,
+  so decide before the first upload. Debug builds append `.debug` and therefore install *alongside*
+  rather than over an existing install.
 - `gradle/libs.versions.toml` now contains only the libraries the app actually uses; the unused
   Firebase / Retrofit / OkHttp / Moshi / CameraX / DataStore / Accompanist entries and their
   version pins are gone. `android.enableR8.fullMode` (a no-op on AGP 8+) was removed from

@@ -9,7 +9,11 @@ android {
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.spotad.recorder"
+    // TESTING ONLY: restored to the original AI Studio id so test builds install over an existing
+    // com.aistudio.spotad.rxnpld install (keeping its data) instead of sitting alongside it.
+    // The namespace stays com.spotad.recorder, so R/BuildConfig and the source tree are unchanged.
+    // For a store release, set this back to "com.spotad.recorder".
+    applicationId = "com.aistudio.spotad.rxnpld"
     minSdk = 24
     targetSdk = 36
     versionCode = 6
