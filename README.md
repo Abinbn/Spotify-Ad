@@ -76,5 +76,7 @@ disabled; only the settings file can be transferred to a new device.
 - Some apps and some OEM builds block playback capture; SpotAd reports a silent capture instead of
   saving it.
 - Aggressive battery managers may stop background services; allow SpotAd to run in the background.
+- Android 15 and newer cap how long a `dataSync` foreground service may run (about six hours a
+  day). SpotAd pauses cleanly and asks you to reopen it instead of failing silently.
 - SpotAd records third-party audio for personal use. Respect copyright and the rights of the
   advertisers whose work you keep.

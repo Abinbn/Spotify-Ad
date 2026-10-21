@@ -197,6 +197,10 @@ These are not bugs; they are constraints that shape the product and the store li
 5. **Foreground service type.** Monitoring while idle uses `dataSync`. Play review may ask why;
    the answer is "user-initiated background monitoring of Spotify metadata". Recording time uses
    `mediaProjection` as required.
+   **Android 15 (API 35) caps `dataSync` foreground services at ~6 hours per 24 h.** `onTimeout`
+   is implemented: monitoring pauses, the projection is released, the notification goes away and
+   the UI says "Open SpotAd to resume". Without that override the OS would crash the app. Do not
+   "fix" this by starting a second silent foreground service — it is a policy limit, not a bug.
 6. **Copyright / Play policy.** The app records third-party audio for personal use. Keep the
    in-app disclaimer, do not add upload/sharing features, and describe it accurately in the Data
    Safety form ("Audio files: collected? No — stored on device only").
