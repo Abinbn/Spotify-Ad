@@ -1,0 +1,6 @@
+{
+  "summary": "Comprehensive implementation plan for SpotAd Recorder: hybrid audio fingerprinting (speech vs music acoustic analysis + Spotify broadcast sync), on-device speech keyword and theme extraction, background recording service with sleep lifecycle, Studio card feed with sorting and waveform scrubbers, MP3 export, and built-in audio player.",
+  "updatedAt": "2026-10-20T11:17:25.562448411Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

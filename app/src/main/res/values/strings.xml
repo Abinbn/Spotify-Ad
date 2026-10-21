@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">SpotAd Recorder</string>
+    <string name="spotify_listener_service_label">SpotAd Spotify Ad Detection Service</string>
+    <string name="notification_channel_name">SpotAd Background Monitor</string>
+    <string name="notification_channel_desc">Shows background monitoring and ad recording status</string>
+    <string name="status_sleeping">Monitoring Spotify (Standby)</string>
+    <string name="status_recording">Recording Spotify Ad…</string>
+    <string name="status_idle">Monitoring Disabled</string>
+    <string name="permission_audio_desc">SpotAd needs Audio permission to record ad audio.</string>
+    <string name="permission_notification_desc">SpotAd needs Notification permission to display real-time recording alerts.</string>
+    <string name="permission_listener_desc">Notification access is needed to detect Spotify track changes and ad titles.</string>
+</resources>
