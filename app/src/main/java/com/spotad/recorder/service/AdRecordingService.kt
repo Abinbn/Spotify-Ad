@@ -17,6 +17,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.spotad.recorder.MainActivity
@@ -694,6 +695,31 @@ class AdRecordingService : Service() {
             @Suppress("DEPRECATION")
             stopForeground(true)
         }
+    }
+
+    /**
+     * Android 15+ caps `dataSync` foreground services at roughly six hours per day. When the
+     * budget runs out the system calls this method and expects the service to stop promptly -
+     * ignoring it crashes the app. Stop cleanly, keep `monitoringEnabled` so the next app launch
+     * (or a user tap) resumes, and tell the user why nothing is being recorded.
+     */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        if (fgsType != ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) {
+            super.onTimeout(startId, fgsType)
+            return
+        }
+        Log.i(TAG, "dataSync foreground service timeout; pausing monitoring")
+        finishRecording(reason = "Background monitoring paused by Android", notifySaved = true)
+        releaseProjection()
+        publishState(
+            state = MonitoringState.NEEDS_ACCESS,
+            captureGranted = false,
+            error = "Android pauses background monitoring after about six hours. " +
+                "Open SpotAd to resume."
+        )
+        stopForegroundCompat()
+        stopSelf(startId)
     }
 
     override fun onDestroy() {
